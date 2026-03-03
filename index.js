@@ -1,11 +1,32 @@
+require('dotenv').config();
+
 const express = require('express');
 const fs = require('fs');
 const csv = require('csv-parser');
+const rateLimit = require('express-rate-limit');
+const analyzeRouter = require('./routes/analyze');
 
 const app = express();
 const PORT = 3000;
+app.use(express.json({ limit: '10kb' }));
 
 let products = [];
+
+const analyzeLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    return res.status(429).json({
+      success: false,
+      error: {
+        code: 'RATE_LIMIT',
+        message: 'Too many requests. Please try again later.',
+      },
+    });
+  },
+});
 
 function loadCSV() {
   return new Promise((resolve, reject) => {
@@ -45,6 +66,22 @@ app.get('/api/products', (req, res) => {
     count: mapped.length,
     results: mapped,
   });
+});
+
+app.use('/api/analyze-ingredients', analyzeLimiter, analyzeRouter);
+
+app.use((err, req, res, next) => {
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    return res.status(400).json({
+      success: false,
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'Invalid JSON body.',
+      },
+    });
+  }
+
+  return next(err);
 });
 
 loadCSV()
