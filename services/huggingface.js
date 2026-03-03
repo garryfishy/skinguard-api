@@ -4,12 +4,15 @@ const HF_CHAT_ENDPOINT = "https://router.huggingface.co/v1/chat/completions";
 function buildPrompt(ingredientText) {
   return [
     "You are a cosmetic safety analyzer.",
+    "Use Bahasa Indonesia for all descriptive text fields.",
     "Given product label ingredient text, identify only potentially risky/dangerous ingredients.",
     "Return ONLY valid JSON with this exact structure:",
-    '{"riskyIngredients":[{"name":"string","aliases":["string"],"risk":"string","severity":"high|medium|low"}],"totalDetected":number}',
+    '{"riskyIngredients":[{"name":"string","aliases":["string"],"risk":"string","severity":"high|medium|low","severityReason":"string"}],"totalDetected":number}',
     "Rules:",
     "- riskyIngredients can be empty array.",
     "- totalDetected is total number of ingredients detected in input text.",
+    "- risk must be a detailed but concise explanation (1-3 sentences) of why the ingredient is harmful, in Bahasa Indonesia.",
+    "- severityReason must explain why severity is high/medium/low based on toxicity, regulation, and exposure risk, in Bahasa Indonesia.",
     "- Do not include markdown or explanations.",
     "",
     `Ingredient text: ${ingredientText}`,
@@ -41,7 +44,7 @@ async function analyzeIngredients(text) {
           {
             role: "system",
             content:
-              'You are a cosmetic safety analyzer. Return ONLY valid JSON with structure {"riskyIngredients":[{"name":"string","aliases":["string"],"risk":"string","severity":"high|medium|low"}],"totalDetected":number}.',
+              'You are a cosmetic safety analyzer. Return ONLY valid JSON with structure {"riskyIngredients":[{"name":"string","aliases":["string"],"risk":"string","severity":"high|medium|low","severityReason":"string"}],"totalDetected":number}. Use Bahasa Indonesia for all descriptive text fields. "risk" must be 1-3 concise sentences, and "severityReason" must justify the selected severity.',
           },
           {
             role: "user",

@@ -1,3 +1,48 @@
+const NON_INGREDIENT_PATTERNS = [
+  /\bmade in\b/i,
+  /\bnetto\b/i,
+  /\bexp(iry)?\b/i,
+  /\bbpom\b/i,
+  /\bhow to use\b/i,
+  /\bcara pakai\b/i,
+  /\bwarning\b/i,
+  /\bperingatan\b/i,
+  /\bfor external use\b/i,
+  /\bno\.?\s*\d+/i,
+  /https?:\/\//i,
+  /www\./i,
+];
+
+const CANONICAL_ALIASES = {
+  mercury: ['merkuri', 'raksa', 'hg', 'mercuric chloride', 'mercury chloride'],
+  hydroquinone: ['hidrokuinon'],
+  lead: ['timbal', 'pb'],
+  arsenic: ['arsen'],
+  'rhodamine b': ['rhoda min b', 'rhoda mine b'],
+  water: ['aqua'],
+};
+
+const ALIAS_TO_CANONICAL = Object.entries(CANONICAL_ALIASES).reduce((acc, [canonical, aliases]) => {
+  acc[canonical] = canonical;
+  for (const alias of aliases) {
+    acc[alias] = canonical;
+  }
+  return acc;
+}, {});
+
+function normalizeKey(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function canonicalKey(value) {
+  const key = normalizeKey(value);
+  return ALIAS_TO_CANONICAL[key] || key;
+}
+
 function clampSeverity(value) {
   const normalized = String(value || '').trim().toLowerCase();
   if (normalized === 'high' || normalized === 'medium' || normalized === 'low') {
@@ -6,14 +51,36 @@ function clampSeverity(value) {
   return 'medium';
 }
 
+function isLikelyIngredient(token) {
+  if (!token || token.length < 2 || token.length > 80) {
+    return false;
+  }
+
+  const normalized = token.toLowerCase();
+  if (NON_INGREDIENT_PATTERNS.some((pattern) => pattern.test(normalized))) {
+    return false;
+  }
+
+  const words = token.split(/\s+/).filter(Boolean).length;
+  if (words > 6) {
+    return false;
+  }
+
+  if (/^[0-9.\-+%\s]+$/.test(token)) {
+    return false;
+  }
+
+  return /[a-z]/i.test(token);
+}
+
 function extractDetectedIngredients(ingredientText) {
   if (typeof ingredientText !== 'string') {
     return [];
   }
 
   const cleaned = ingredientText
-    .replace(/ingredients?\s*:/gi, '')
-    .replace(/\(.*?\)/g, ' ')
+    .replace(/ingredients?|komposisi|kandungan\s*:/gi, '')
+    .replace(/[()\[\]]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 
@@ -21,21 +88,27 @@ function extractDetectedIngredients(ingredientText) {
     return [];
   }
 
-  const items = cleaned
+  const rawItems = cleaned
     .split(/[,;\n|/]+/)
     .map((part) => part.trim())
     .map((part) => part.replace(/^[\-\d.\s]+/, '').trim())
-    .map((part) => part.replace(/\s{2,}/g, ' '))
-    .filter((part) => part.length >= 2);
+    .map((part) => part.replace(/^[:\-–—\s]+/, '').trim())
+    .map((part) => part.replace(/\s{2,}/g, ' '));
 
   const unique = [];
   const seen = new Set();
-  for (const item of items) {
-    const key = item.toLowerCase();
-    if (!seen.has(key)) {
-      seen.add(key);
-      unique.push(item);
+  for (const item of rawItems) {
+    if (!isLikelyIngredient(item)) {
+      continue;
     }
+
+    const key = canonicalKey(item);
+    if (!key || seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    unique.push(item);
   }
 
   return unique;
@@ -46,10 +119,27 @@ function sanitizeAliases(aliases) {
     return [];
   }
 
-  return aliases
-    .map((alias) => String(alias || '').trim())
-    .filter(Boolean)
-    .slice(0, 10);
+  const seen = new Set();
+  const result = [];
+  for (const alias of aliases) {
+    const cleaned = String(alias || '').trim();
+    if (!cleaned) {
+      continue;
+    }
+
+    const key = canonicalKey(cleaned);
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    result.push(cleaned);
+    if (result.length >= 10) {
+      break;
+    }
+  }
+
+  return result;
 }
 
 function normalizeIngredient(item) {
@@ -62,11 +152,26 @@ function normalizeIngredient(item) {
     return null;
   }
 
+  const severity = clampSeverity(item.severity);
+  const severityReason = String(
+    item.severityReason || item.severity_reason || item.severityExplanation || ''
+  ).trim();
+
+  let defaultSeverityReason = 'Potential concern identified based on available safety context.';
+  if (severity === 'high') {
+    defaultSeverityReason = 'High risk due to strong toxicity concerns and/or common regulatory restrictions.';
+  } else if (severity === 'medium') {
+    defaultSeverityReason = 'Moderate risk due to possible irritation/toxicity depending on concentration and exposure.';
+  } else if (severity === 'low') {
+    defaultSeverityReason = 'Lower risk in typical use, but still flagged due to possible sensitivity or misuse.';
+  }
+
   return {
     name,
     aliases: sanitizeAliases(item.aliases),
     risk: String(item.risk || 'No description available').trim() || 'No description available',
-    severity: clampSeverity(item.severity),
+    severity,
+    severityReason: severityReason || defaultSeverityReason,
   };
 }
 
@@ -89,9 +194,63 @@ function extractJsonChunk(rawText) {
   return '';
 }
 
+function severityScore(value) {
+  if (value === 'high') {
+    return 3;
+  }
+  if (value === 'medium') {
+    return 2;
+  }
+  return 1;
+}
+
+function mergeRiskyIngredients(items) {
+  const merged = new Map();
+
+  for (const item of items) {
+    const key = canonicalKey(item.name);
+    if (!key) {
+      continue;
+    }
+
+    if (!merged.has(key)) {
+      merged.set(key, {
+        name: item.name,
+        aliases: [...item.aliases],
+        risk: item.risk,
+        severity: item.severity,
+        severityReason: item.severityReason,
+      });
+      continue;
+    }
+
+    const existing = merged.get(key);
+    const aliasPool = [...existing.aliases, item.name, ...item.aliases];
+    existing.aliases = sanitizeAliases(aliasPool);
+
+    if (severityScore(item.severity) > severityScore(existing.severity)) {
+      existing.severity = item.severity;
+    }
+
+    if (item.risk.length > existing.risk.length) {
+      existing.risk = item.risk;
+    }
+
+    if (
+      typeof item.severityReason === 'string' &&
+      item.severityReason.length > String(existing.severityReason || '').length
+    ) {
+      existing.severityReason = item.severityReason;
+    }
+  }
+
+  return Array.from(merged.values());
+}
+
 function parseAIResponse(rawText, ingredientText = '') {
   const fallback = {
     riskyIngredients: [],
+    safeIngredients: [],
     safeCount: 0,
     totalDetected: 0,
     summary: 'Could not reliably extract ingredients.',
@@ -112,40 +271,50 @@ function parseAIResponse(rawText, ingredientText = '') {
 
   const detectedIngredients = extractDetectedIngredients(ingredientText);
   let rawIngredients = [];
-  let totalDetected = 0;
+  let aiTotalDetected = 0;
 
   if (Array.isArray(parsed)) {
     rawIngredients = parsed;
-    totalDetected = parsed.length;
+    aiTotalDetected = parsed.length;
   } else if (parsed && typeof parsed === 'object') {
     if (Array.isArray(parsed.riskyIngredients)) {
       rawIngredients = parsed.riskyIngredients;
     }
 
     if (typeof parsed.totalDetected === 'number' && Number.isFinite(parsed.totalDetected)) {
-      totalDetected = Math.max(0, Math.floor(parsed.totalDetected));
+      aiTotalDetected = Math.max(0, Math.floor(parsed.totalDetected));
     }
   }
 
-  const riskyIngredients = rawIngredients.map(normalizeIngredient).filter(Boolean);
+  const normalizedRisky = rawIngredients.map(normalizeIngredient).filter(Boolean);
+  const riskyIngredients = mergeRiskyIngredients(normalizedRisky);
+  const riskyKeys = new Set();
 
+  for (const risky of riskyIngredients) {
+    riskyKeys.add(canonicalKey(risky.name));
+    for (const alias of risky.aliases) {
+      riskyKeys.add(canonicalKey(alias));
+    }
+  }
+
+  const safeIngredients = detectedIngredients.filter((item) => !riskyKeys.has(canonicalKey(item)));
+
+  let totalDetected = detectedIngredients.length;
   if (totalDetected === 0) {
-    totalDetected = detectedIngredients.length || riskyIngredients.length;
+    totalDetected = Math.max(aiTotalDetected, riskyIngredients.length);
   }
-
-  if (detectedIngredients.length > totalDetected) {
-    totalDetected = detectedIngredients.length;
-  }
-
   if (totalDetected < riskyIngredients.length) {
     totalDetected = riskyIngredients.length;
   }
 
-  const safeCount = Math.max(0, totalDetected - riskyIngredients.length);
+  const safeCount = detectedIngredients.length > 0
+    ? safeIngredients.length
+    : Math.max(0, totalDetected - riskyIngredients.length);
   const summary = `${riskyIngredients.length} of ${totalDetected} detected ingredients are flagged as risky.`;
 
   return {
     riskyIngredients,
+    safeIngredients,
     safeCount,
     totalDetected,
     summary,
