@@ -7,12 +7,14 @@ function buildPrompt(ingredientText) {
     "Use Bahasa Indonesia for all descriptive text fields.",
     "Given product label ingredient text, identify only potentially risky/dangerous ingredients.",
     "Return ONLY valid JSON with this exact structure:",
-    '{"riskyIngredients":[{"name":"string","aliases":["string"],"risk":"string","severity":"high|medium|low","severityReason":"string"}],"totalDetected":number}',
+    '{"riskyIngredients":[{"name":"string","aliases":["string"],"risk":"string","severity":"high|medium|low","severityReason":"string","pregnancy":{"safe":true|false,"reason":"string"},"recommendation":{"safe":true|false,"reason":"string"}}],"totalDetected":number}',
     "Rules:",
     "- riskyIngredients can be empty array.",
     "- totalDetected is total number of ingredients detected in input text.",
     "- risk must be a detailed but concise explanation (1-3 sentences) of why the ingredient is harmful, in Bahasa Indonesia.",
     "- severityReason must explain why severity is high/medium/low based on toxicity, regulation, and exposure risk, in Bahasa Indonesia.",
+    "- pregnancy.safe must be boolean and pregnancy.reason must explain if this ingredient is safe for pregnant users, in Bahasa Indonesia.",
+    "- recommendation.safe must be boolean and recommendation.reason must explain whether the product is advisable to buy considering this ingredient, in Bahasa Indonesia.",
     "- Do not include markdown or explanations.",
     "",
     `Ingredient text: ${ingredientText}`,
@@ -44,7 +46,7 @@ async function analyzeIngredients(text) {
           {
             role: "system",
             content:
-              'You are a cosmetic safety analyzer. Return ONLY valid JSON with structure {"riskyIngredients":[{"name":"string","aliases":["string"],"risk":"string","severity":"high|medium|low","severityReason":"string"}],"totalDetected":number}. Use Bahasa Indonesia for all descriptive text fields. "risk" must be 1-3 concise sentences, and "severityReason" must justify the selected severity.',
+              'You are a cosmetic safety analyzer. Return ONLY valid JSON with structure {"riskyIngredients":[{"name":"string","aliases":["string"],"risk":"string","severity":"high|medium|low","severityReason":"string","pregnancy":{"safe":true|false,"reason":"string"},"recommendation":{"safe":true|false,"reason":"string"}}],"totalDetected":number}. Use Bahasa Indonesia for all descriptive text fields. "risk" must be 1-3 concise sentences, "severityReason" must justify the selected severity, "pregnancy.reason" must explain pregnancy safety, and "recommendation.reason" must explain buy recommendation.',
           },
           {
             role: "user",

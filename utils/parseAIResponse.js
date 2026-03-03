@@ -166,12 +166,56 @@ function normalizeIngredient(item) {
     defaultSeverityReason = 'Lower risk in typical use, but still flagged due to possible sensitivity or misuse.';
   }
 
+  const pregnancySafeRaw =
+    item?.pregnancy?.safe ??
+    item?.pregnancySafe ??
+    item?.pregnancy_safe;
+  const pregnancySafe = typeof pregnancySafeRaw === 'boolean' ? pregnancySafeRaw : false;
+  const pregnancyReasonRaw =
+    item?.pregnancy?.reason ??
+    item?.pregnancyReason ??
+    item?.pregnancy_reason;
+  const pregnancyReason = String(pregnancyReasonRaw || '').trim();
+  const defaultPregnancyReason = pregnancySafe
+    ? 'Umumnya dianggap lebih aman untuk kehamilan bila digunakan sesuai aturan, namun tetap disarankan konsultasi medis.'
+    : 'Tidak disarankan saat hamil karena potensi risiko pada ibu/janin dan keterbatasan data keamanan.';
+
+  const recommendationSafeRaw =
+    item?.recommendation?.safe ??
+    item?.recommendationSafe ??
+    item?.recommendation_safe ??
+    item?.safeToBuy?.safe ??
+    item?.safe_to_buy?.safe ??
+    item?.safeToBuySafe ??
+    item?.safe_to_buy_safe;
+  const recommendationSafe = typeof recommendationSafeRaw === 'boolean' ? recommendationSafeRaw : false;
+  const recommendationReasonRaw =
+    item?.recommendation?.reason ??
+    item?.recommendationReason ??
+    item?.recommendation_reason ??
+    item?.safeToBuy?.reason ??
+    item?.safe_to_buy?.reason ??
+    item?.safeToBuyReason ??
+    item?.safe_to_buy_reason;
+  const recommendationReason = String(recommendationReasonRaw || '').trim();
+  const defaultRecommendationReason = recommendationSafe
+    ? 'Secara umum masih layak dibeli jika produk memiliki izin edar resmi dan digunakan sesuai petunjuk.'
+    : 'Tidak direkomendasikan untuk dibeli karena profil risikonya tinggi atau indikasi keamanan tidak memadai.';
+
   return {
     name,
     aliases: sanitizeAliases(item.aliases),
     risk: String(item.risk || 'No description available').trim() || 'No description available',
     severity,
     severityReason: severityReason || defaultSeverityReason,
+    pregnancy: {
+      safe: pregnancySafe,
+      reason: pregnancyReason || defaultPregnancyReason,
+    },
+    recommendation: {
+      safe: recommendationSafe,
+      reason: recommendationReason || defaultRecommendationReason,
+    },
   };
 }
 
@@ -220,6 +264,8 @@ function mergeRiskyIngredients(items) {
         risk: item.risk,
         severity: item.severity,
         severityReason: item.severityReason,
+        pregnancy: item.pregnancy,
+        recommendation: item.recommendation,
       });
       continue;
     }
@@ -241,6 +287,32 @@ function mergeRiskyIngredients(items) {
       item.severityReason.length > String(existing.severityReason || '').length
     ) {
       existing.severityReason = item.severityReason;
+    }
+
+    if (item.pregnancy && typeof item.pregnancy.safe === 'boolean') {
+      if (item.pregnancy.safe === false) {
+        existing.pregnancy.safe = false;
+      }
+
+      if (
+        typeof item.pregnancy.reason === 'string' &&
+        item.pregnancy.reason.length > String(existing.pregnancy?.reason || '').length
+      ) {
+        existing.pregnancy.reason = item.pregnancy.reason;
+      }
+    }
+
+    if (item.recommendation && typeof item.recommendation.safe === 'boolean') {
+      if (item.recommendation.safe === false) {
+        existing.recommendation.safe = false;
+      }
+
+      if (
+        typeof item.recommendation.reason === 'string' &&
+        item.recommendation.reason.length > String(existing.recommendation?.reason || '').length
+      ) {
+        existing.recommendation.reason = item.recommendation.reason;
+      }
     }
   }
 
