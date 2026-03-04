@@ -1,6 +1,7 @@
 const HF_API_TOKEN = process.env.HF_API_TOKEN;
 const HF_MODEL_ID = process.env.HF_MODEL_ID || "Qwen/Qwen2.5-7B-Instruct";
 const HF_CHAT_ENDPOINT = "https://router.huggingface.co/v1/chat/completions";
+
 function buildPrompt(ingredientText) {
   return [
     "You are a cosmetic safety analyzer.",

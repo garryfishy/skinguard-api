@@ -6,3 +6,4 @@ pnpm-debug.log*
 .DS_Store
 .env
 .env.*
+data/ingredient_decisions.json

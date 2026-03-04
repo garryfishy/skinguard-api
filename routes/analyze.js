@@ -2,6 +2,7 @@ const express = require('express');
 const { analyzeIngredients, HF_MODEL_ID } = require('../services/huggingface');
 const { parseAIResponse } = require('../utils/parseAIResponse');
 const { verifyParsedIngredientsOnline } = require('../utils/verifyIngredientOnline');
+const { stabilizeWithIngredientMemory } = require('../utils/ingredientDecisionMemory');
 
 const router = express.Router();
 const ANALYSIS_CACHE_TTL_MS = Number(process.env.ANALYSIS_CACHE_TTL_MS || 30 * 60 * 1000);
@@ -109,13 +110,14 @@ router.post('/', async (req, res) => {
     const rawResult = await analyzeIngredients(sanitizedText);
     const parsed = parseAIResponse(rawResult, sanitizedText);
     const verified = await verifyParsedIngredientsOnline(parsed);
-    if (Number(verified?.totalDetected || 0) > 0) {
-      setCachedAnalysis(cacheKey, verified);
+    const stabilized = stabilizeWithIngredientMemory(verified);
+    if (Number(stabilized?.totalDetected || 0) > 0) {
+      setCachedAnalysis(cacheKey, stabilized);
     }
 
     return res.status(200).json({
       success: true,
-      data: verified,
+      data: stabilized,
       meta: {
         model: HF_MODEL_ID,
         analysisTimeMs: Date.now() - startedAt,
