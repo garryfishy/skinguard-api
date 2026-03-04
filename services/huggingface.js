@@ -11,6 +11,8 @@ function buildPrompt(ingredientText) {
     "Rules:",
     "- riskyIngredients can be empty array.",
     "- totalDetected is total number of ingredients detected in input text.",
+    "- Only return ingredients that are explicitly present in the provided ingredient text.",
+    "- Never include company name, brand name, address, BPOM number, batch code, or legal/marketing text as ingredients.",
     "- risk must be a detailed but concise explanation (1-3 sentences) of why the ingredient is harmful, in Bahasa Indonesia.",
     "- severityReason must explain why severity is high/medium/low based on toxicity, regulation, and exposure risk, in Bahasa Indonesia.",
     "- pregnancy.safe must be boolean and pregnancy.reason must explain if this ingredient is safe for pregnant users, in Bahasa Indonesia.",
@@ -48,7 +50,7 @@ async function analyzeIngredients(text) {
           {
             role: "system",
             content:
-              'You are a cosmetic safety analyzer. Return ONLY valid JSON with structure {"riskyIngredients":[{"name":"string","aliases":["string"],"risk":"string","severity":"high|medium|low","severityReason":"string","pregnancy":{"safe":true|false,"reason":"string"},"recommendation":{"safe":true|false,"reason":"string"}}],"totalDetected":number}. Use Bahasa Indonesia for all descriptive text fields. "risk" must be 1-3 concise sentences, "severityReason" must justify the selected severity, "pregnancy.reason" must explain pregnancy safety, and "recommendation.reason" must explain buy recommendation. recommendation.safe is false only for clearly dangerous/prohibited ingredients or likely high-concentration high risk; otherwise it may be true with caution.',
+              'You are a cosmetic safety analyzer. Return ONLY valid JSON with structure {"riskyIngredients":[{"name":"string","aliases":["string"],"risk":"string","severity":"high|medium|low","severityReason":"string","pregnancy":{"safe":true|false,"reason":"string"},"recommendation":{"safe":true|false,"reason":"string"}}],"totalDetected":number}. Use Bahasa Indonesia for all descriptive text fields. Only include ingredients explicitly present in the given ingredient text. Never include company/brand/address/BPOM/batch/legal text as ingredients. "risk" must be 1-3 concise sentences, "severityReason" must justify the selected severity, "pregnancy.reason" must explain pregnancy safety, and "recommendation.reason" must explain buy recommendation. recommendation.safe is false only for clearly dangerous/prohibited ingredients or likely high-concentration high risk; otherwise it may be true with caution.',
           },
           {
             role: "user",

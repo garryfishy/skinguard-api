@@ -2,11 +2,27 @@ const NON_INGREDIENT_PATTERNS = [
   /\bmade in\b/i,
   /\bnetto\b/i,
   /\bexp(iry)?\b/i,
+  /\bbatch\b/i,
+  /\blot\b/i,
+  /\bmfg\b/i,
   /\bbpom\b/i,
   /\bhow to use\b/i,
   /\bcara pakai\b/i,
   /\bwarning\b/i,
   /\bperingatan\b/i,
+  /\bmanufactured by\b/i,
+  /\bdistributed by\b/i,
+  /\bdiproduksi oleh\b/i,
+  /\bdipasarkan oleh\b/i,
+  /\bcompany\b/i,
+  /\balamat\b/i,
+  /\baddress\b/i,
+  /\bcustomer service\b/i,
+  /\bpt\b/i,
+  /\bcv\b/i,
+  /\bltd\b/i,
+  /\binc\b/i,
+  /\bllc\b/i,
   /\bfor external use\b/i,
   /\bno\.?\s*\d+/i,
   /https?:\/\//i,
@@ -108,12 +124,54 @@ function isLikelyIngredient(token) {
   return /[a-z]/i.test(token);
 }
 
+function extractIngredientSection(ingredientText) {
+  const text = String(ingredientText || '');
+  if (!text.trim()) {
+    return '';
+  }
+
+  const startRegex = /(ingredients?|komposisi|kandungan)\s*:/i;
+  const startMatch = startRegex.exec(text);
+  const start = startMatch ? startMatch.index + startMatch[0].length : 0;
+
+  const lower = text.toLowerCase();
+  const stopMarkers = [
+    'how to use',
+    'cara pakai',
+    'warning',
+    'peringatan',
+    'manufactured by',
+    'distributed by',
+    'diproduksi oleh',
+    'dipasarkan oleh',
+    'bpom',
+    'netto',
+    'exp',
+    'mfg',
+    'batch',
+    'lot',
+    'alamat',
+    'address',
+  ];
+
+  let end = text.length;
+  for (const marker of stopMarkers) {
+    const idx = lower.indexOf(marker, start);
+    if (idx !== -1 && idx < end) {
+      end = idx;
+    }
+  }
+
+  return text.slice(start, end);
+}
+
 function extractDetectedIngredients(ingredientText) {
   if (typeof ingredientText !== 'string') {
     return [];
   }
 
-  const cleaned = ingredientText
+  const sourceSection = extractIngredientSection(ingredientText);
+  const cleaned = sourceSection
     .replace(/ingredients?|komposisi|kandungan\s*:/gi, '')
     .replace(/[()\[\]]/g, ' ')
     .replace(/\s+/g, ' ')
@@ -147,6 +205,44 @@ function extractDetectedIngredients(ingredientText) {
   }
 
   return unique;
+}
+
+function escapeRegex(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function buildDetectedKeySet(detectedIngredients) {
+  const keys = new Set();
+  for (const ingredient of detectedIngredients) {
+    const key = canonicalKey(ingredient);
+    if (key) {
+      keys.add(key);
+    }
+  }
+  return keys;
+}
+
+function isIngredientMentionedInSource(item, detectedKeySet, ingredientText) {
+  const normalizedSource = normalizeKey(ingredientText);
+  const candidates = [item.name, ...(Array.isArray(item.aliases) ? item.aliases : [])];
+
+  for (const candidate of candidates) {
+    const key = canonicalKey(candidate);
+    if (!key) {
+      continue;
+    }
+
+    if (detectedKeySet.has(key)) {
+      return true;
+    }
+
+    const regex = new RegExp(`\\b${escapeRegex(key)}\\b`, 'i');
+    if (normalizedSource && regex.test(normalizedSource)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function sanitizeAliases(aliases) {
@@ -497,8 +593,20 @@ function parseAIResponse(rawText, ingredientText = '') {
 
   const normalizedRisky = rawIngredients.map(normalizeIngredient).filter(Boolean);
   const riskyIngredientsMerged = mergeRiskyIngredients(normalizedRisky);
+  const detectedKeySet = buildDetectedKeySet(detectedIngredients);
+  const riskyIngredientsInputMatched = riskyIngredientsMerged.filter((item) => {
+    if (!isLikelyIngredient(item.name)) {
+      return false;
+    }
+
+    if (detectedIngredients.length === 0) {
+      return true;
+    }
+
+    return isIngredientMentionedInSource(item, detectedKeySet, ingredientText);
+  });
   const detectedIndexMap = buildDetectedIngredientIndex(detectedIngredients);
-  const riskyIngredients = riskyIngredientsMerged.map((item) => {
+  const riskyIngredients = riskyIngredientsInputMatched.map((item) => {
     const index = findIngredientIndex(item, detectedIndexMap);
     const computedRecommendation = computeRecommendation(item, index);
     const aiReason = String(item?.recommendation?.reason || '').trim();
