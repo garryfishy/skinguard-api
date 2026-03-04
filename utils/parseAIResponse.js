@@ -33,6 +33,13 @@ const NON_INGREDIENT_PATTERNS = [
   /\binc\b/i,
   /\bllc\b/i,
   /\bfor external use\b/i,
+  /\bapply\b/i,
+  /\bgunakan\b/i,
+  /\busage\b/i,
+  /\bavoid\b/i,
+  /\bhindari\b/i,
+  /\bkeep out of reach\b/i,
+  /\bjauhkan dari jangkauan\b/i,
   /\bno\.?\s*\d+/i,
   /https?:\/\//i,
   /www\./i,
@@ -131,6 +138,7 @@ function isLikelyIngredient(token) {
     /(?:netto?|net)\d+(ml|l|g|kg|oz)/i.test(compact) ||
     /^\d+(ml|l|g|kg|oz)$/i.test(compact) ||
     /^(bpom|batch|lot|exp|expiry|mfg)[a-z0-9-]*$/i.test(compact) ||
+    /^[a-z]{0,4}\d+[a-z0-9-]*$/i.test(compact) ||
     /(manufacturedby|distributedby|diproduksioleh|dipasarkanoleh|customerservice|madein|forexternaluse|warning|peringatan)/i.test(compact)
   ) {
     return false;
@@ -168,41 +176,15 @@ function extractIngredientSection(ingredientText) {
   const startMatch = startRegex.exec(text);
   const start = startMatch ? startMatch.index + startMatch[0].length : 0;
 
-  const lower = text.toLowerCase();
-  const stopMarkers = [
-    'how to use',
-    'cara pakai',
-    'warning',
-    'peringatan',
-    'manufactured by',
-    'manufacturedby',
-    'distributed by',
-    'distributedby',
-    'diproduksi oleh',
-    'diproduksioleh',
-    'dipasarkan oleh',
-    'dipasarkanoleh',
-    'bpom',
-    'net ',
-    'netto',
-    'isi bersih',
-    'exp',
-    'mfg',
-    'batch',
-    'lot',
-    'alamat',
-    'address',
-  ];
-
-  let end = text.length;
-  for (const marker of stopMarkers) {
-    const idx = lower.indexOf(marker, start);
-    if (idx !== -1 && idx < end) {
-      end = idx;
-    }
+  const section = text.slice(start);
+  const breakHeaderRegex =
+    /(?:^|[\n\r]|[.;])\s*(?:how to use|cara pakai|warning|peringatan|manufactured by|manufacturedby|distributed by|distributedby|diproduksi oleh|diproduksioleh|dipasarkan oleh|dipasarkanoleh|alamat|address|customer service|customerservice|bpom|batch|lot|exp(?:iry)?|mfg)\s*:/i;
+  const breakMatch = breakHeaderRegex.exec(section);
+  if (!breakMatch || typeof breakMatch.index !== 'number') {
+    return section;
   }
 
-  return text.slice(start, end);
+  return section.slice(0, breakMatch.index);
 }
 
 function extractDetectedIngredients(ingredientText) {

@@ -96,9 +96,15 @@ router.post('/', async (req, res) => {
     const cacheKey = normalizeCacheKey(sanitizedText);
     const cachedData = getCachedAnalysis(cacheKey);
     if (cachedData) {
+      const refreshedCached = await stabilizeWithIngredientMemory(cachedData, {
+        forceInternetRecheck: true,
+      });
+      if (Number(refreshedCached?.totalDetected || 0) > 0) {
+        setCachedAnalysis(cacheKey, refreshedCached);
+      }
       return res.status(200).json({
         success: true,
-        data: cachedData,
+        data: refreshedCached,
         meta: {
           model: HF_MODEL_ID,
           analysisTimeMs: Date.now() - startedAt,
@@ -110,7 +116,9 @@ router.post('/', async (req, res) => {
     const rawResult = await analyzeIngredients(sanitizedText);
     const parsed = parseAIResponse(rawResult, sanitizedText);
     const verified = await verifyParsedIngredientsOnline(parsed);
-    const stabilized = stabilizeWithIngredientMemory(verified);
+    const stabilized = await stabilizeWithIngredientMemory(verified, {
+      forceInternetRecheck: true,
+    });
     if (Number(stabilized?.totalDetected || 0) > 0) {
       setCachedAnalysis(cacheKey, stabilized);
     }

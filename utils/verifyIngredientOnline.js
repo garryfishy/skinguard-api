@@ -1,8 +1,54 @@
 const PUBCHEM_BASE_URL = 'https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name';
+const PUBCHEM_GHS_BASE_URL = 'https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound';
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const LOOKUP_TIMEOUT_MS = 2500;
 const MAX_ONLINE_LOOKUPS = 24;
 const LOOKUP_CONCURRENCY = 6;
+const DEFAULT_SAFETY_RECHECK_BUDGET = 4;
+
+const SEVERE_GHS_CODES = new Set([
+  'H300',
+  'H301',
+  'H310',
+  'H311',
+  'H314',
+  'H317',
+  'H318',
+  'H330',
+  'H331',
+  'H334',
+  'H340',
+  'H341',
+  'H350',
+  'H351',
+  'H360',
+  'H361',
+  'H362',
+  'H370',
+  'H371',
+  'H372',
+  'H373',
+  'H400',
+  'H410',
+  'H411',
+]);
+
+const ALWAYS_RISKY_KEYS = new Set([
+  'mercury',
+  'merkuri',
+  'raksa',
+  'mercury chloride',
+  'hydroquinone',
+  'hidrokuinon',
+  'lead',
+  'timbal',
+  'arsenic',
+  'rhodamine b',
+  'tretinoin',
+  'retinoic acid',
+  'clobetasol',
+  'clobetasol propionate',
+]);
 
 const KNOWN_INGREDIENT_KEYS = new Set([
   'water',
@@ -58,6 +104,8 @@ const NON_INGREDIENT_PATTERNS = [
 ];
 
 const validationCache = new Map();
+const cidCache = new Map();
+const hazardCache = new Map();
 
 function normalizeKey(value) {
   return String(value || '')
@@ -147,6 +195,202 @@ function getCachedResult(key) {
 
 function setCachedResult(key, value) {
   validationCache.set(key, { value, ts: Date.now() });
+}
+
+function getCachedValue(cache, key) {
+  const cached = cache.get(key);
+  if (!cached) {
+    return null;
+  }
+
+  if (Date.now() - cached.ts > CACHE_TTL_MS) {
+    cache.delete(key);
+    return null;
+  }
+
+  return cached.value;
+}
+
+function setCachedValue(cache, key, value) {
+  cache.set(key, { value, ts: Date.now() });
+}
+
+async function lookupPubChemCid(name) {
+  const key = normalizeKey(name);
+  if (!key) {
+    return null;
+  }
+
+  const cached = getCachedValue(cidCache, key);
+  if (cached !== null) {
+    return cached;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LOOKUP_TIMEOUT_MS);
+
+  try {
+    const url = `${PUBCHEM_BASE_URL}/${encodeURIComponent(name)}/cids/JSON`;
+    const res = await fetch(url, { signal: controller.signal });
+
+    if (res.status === 404 || res.status === 400) {
+      setCachedValue(cidCache, key, null);
+      return null;
+    }
+
+    if (!res.ok) {
+      return undefined;
+    }
+
+    const payload = await res.json();
+    const cid =
+      payload &&
+      payload.IdentifierList &&
+      Array.isArray(payload.IdentifierList.CID) &&
+      payload.IdentifierList.CID.length > 0
+        ? Number(payload.IdentifierList.CID[0])
+        : null;
+
+    setCachedValue(cidCache, key, cid);
+    return cid;
+  } catch (error) {
+    return undefined;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function lookupSevereGhsCodesByCid(cid) {
+  const cidNum = Number(cid);
+  if (!Number.isFinite(cidNum) || cidNum <= 0) {
+    return [];
+  }
+
+  const cacheKey = String(cidNum);
+  const cached = getCachedValue(hazardCache, cacheKey);
+  if (cached !== null) {
+    return cached;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LOOKUP_TIMEOUT_MS);
+
+  try {
+    const url = `${PUBCHEM_GHS_BASE_URL}/${cidNum}/JSON?heading=GHS+Classification`;
+    const res = await fetch(url, { signal: controller.signal });
+
+    if (res.status === 404) {
+      setCachedValue(hazardCache, cacheKey, []);
+      return [];
+    }
+
+    if (!res.ok) {
+      return null;
+    }
+
+    const text = await res.text();
+    const allCodes = Array.from(new Set(text.match(/\bH\d{3}\b/g) || []));
+    const severeCodes = allCodes.filter((code) => SEVERE_GHS_CODES.has(code));
+    setCachedValue(hazardCache, cacheKey, severeCodes);
+    return severeCodes;
+  } catch (error) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function isRiskyByRule(candidates) {
+  for (const candidate of candidates) {
+    if (ALWAYS_RISKY_KEYS.has(normalizeKey(candidate))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function ensureBudgetRef(options) {
+  if (
+    options &&
+    options.budget &&
+    typeof options.budget === 'object' &&
+    typeof options.budget.remaining === 'number'
+  ) {
+    return options.budget;
+  }
+
+  return { remaining: DEFAULT_SAFETY_RECHECK_BUDGET };
+}
+
+async function doubleCheckIngredientSafetyOnline(name, aliases = [], options = {}) {
+  const candidates = buildCandidateList(name, aliases);
+  if (candidates.length === 0) {
+    return {
+      status: 'unknown',
+      source: 'validation',
+      reason: 'Data bahan tidak cukup untuk verifikasi online.',
+      codes: [],
+    };
+  }
+
+  if (isRiskyByRule(candidates)) {
+    return {
+      status: 'risky',
+      source: 'rule',
+      reason: 'Bahan ini termasuk daftar bahan berisiko tinggi pada aturan internal.',
+      codes: [],
+    };
+  }
+
+  const budget = ensureBudgetRef(options);
+  let hasResolvedSafe = false;
+
+  for (const candidate of candidates) {
+    if (budget.remaining <= 0) {
+      break;
+    }
+
+    budget.remaining -= 1;
+    const cid = await lookupPubChemCid(candidate);
+    if (cid === undefined || cid === null) {
+      continue;
+    }
+
+    const severeCodes = await lookupSevereGhsCodesByCid(cid);
+    if (severeCodes === null) {
+      continue;
+    }
+
+    if (severeCodes.length > 0) {
+      return {
+        status: 'risky',
+        source: 'pubchem',
+        cid,
+        reason: `Terindikasi kode bahaya GHS pada referensi PubChem (${severeCodes.join(
+          ', '
+        )}).`,
+        codes: severeCodes,
+      };
+    }
+
+    hasResolvedSafe = true;
+  }
+
+  if (hasResolvedSafe) {
+    return {
+      status: 'safe',
+      source: 'pubchem',
+      reason: 'Tidak ditemukan kode bahaya GHS berat pada referensi online yang tersedia.',
+      codes: [],
+    };
+  }
+
+  return {
+    status: 'unknown',
+    source: 'pubchem',
+    reason: 'Verifikasi online tidak konklusif untuk bahan ini.',
+    codes: [],
+  };
 }
 
 async function lookupPubChem(name) {
@@ -338,4 +582,5 @@ async function verifyParsedIngredientsOnline(parsedData) {
 
 module.exports = {
   verifyParsedIngredientsOnline,
+  doubleCheckIngredientSafetyOnline,
 };
