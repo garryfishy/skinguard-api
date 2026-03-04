@@ -180,15 +180,6 @@ function normalizeIngredient(item) {
     ? 'Umumnya dianggap lebih aman untuk kehamilan bila digunakan sesuai aturan, namun tetap disarankan konsultasi medis.'
     : 'Tidak disarankan saat hamil karena potensi risiko pada ibu/janin dan keterbatasan data keamanan.';
 
-  const recommendationSafeRaw =
-    item?.recommendation?.safe ??
-    item?.recommendationSafe ??
-    item?.recommendation_safe ??
-    item?.safeToBuy?.safe ??
-    item?.safe_to_buy?.safe ??
-    item?.safeToBuySafe ??
-    item?.safe_to_buy_safe;
-  const recommendationSafe = typeof recommendationSafeRaw === 'boolean' ? recommendationSafeRaw : false;
   const recommendationReasonRaw =
     item?.recommendation?.reason ??
     item?.recommendationReason ??
@@ -198,9 +189,11 @@ function normalizeIngredient(item) {
     item?.safeToBuyReason ??
     item?.safe_to_buy_reason;
   const recommendationReason = String(recommendationReasonRaw || '').trim();
-  const defaultRecommendationReason = recommendationSafe
-    ? 'Secara umum masih layak dibeli jika produk memiliki izin edar resmi dan digunakan sesuai petunjuk.'
-    : 'Tidak direkomendasikan untuk dibeli karena profil risikonya tinggi atau indikasi keamanan tidak memadai.';
+  const defaultRecommendationReason =
+    'Tidak direkomendasikan untuk dibeli karena bahan ini sudah dikategorikan berisiko pada analisis.';
+  const recommendationReasonNormalized = /aman|direkomendasikan|layak/i.test(recommendationReason)
+    ? defaultRecommendationReason
+    : recommendationReason;
 
   return {
     name,
@@ -213,8 +206,8 @@ function normalizeIngredient(item) {
       reason: pregnancyReason || defaultPregnancyReason,
     },
     recommendation: {
-      safe: recommendationSafe,
-      reason: recommendationReason || defaultRecommendationReason,
+      safe: false,
+      reason: recommendationReasonNormalized || defaultRecommendationReason,
     },
   };
 }

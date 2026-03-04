@@ -15,6 +15,7 @@ function buildPrompt(ingredientText) {
     "- severityReason must explain why severity is high/medium/low based on toxicity, regulation, and exposure risk, in Bahasa Indonesia.",
     "- pregnancy.safe must be boolean and pregnancy.reason must explain if this ingredient is safe for pregnant users, in Bahasa Indonesia.",
     "- recommendation.safe must be boolean and recommendation.reason must explain whether the product is advisable to buy considering this ingredient, in Bahasa Indonesia.",
+    "- Deterministic rule: for any ingredient listed in riskyIngredients, recommendation.safe must always be false.",
     "- Do not include markdown or explanations.",
     "",
     `Ingredient text: ${ingredientText}`,
@@ -46,14 +47,15 @@ async function analyzeIngredients(text) {
           {
             role: "system",
             content:
-              'You are a cosmetic safety analyzer. Return ONLY valid JSON with structure {"riskyIngredients":[{"name":"string","aliases":["string"],"risk":"string","severity":"high|medium|low","severityReason":"string","pregnancy":{"safe":true|false,"reason":"string"},"recommendation":{"safe":true|false,"reason":"string"}}],"totalDetected":number}. Use Bahasa Indonesia for all descriptive text fields. "risk" must be 1-3 concise sentences, "severityReason" must justify the selected severity, "pregnancy.reason" must explain pregnancy safety, and "recommendation.reason" must explain buy recommendation.',
+              'You are a cosmetic safety analyzer. Return ONLY valid JSON with structure {"riskyIngredients":[{"name":"string","aliases":["string"],"risk":"string","severity":"high|medium|low","severityReason":"string","pregnancy":{"safe":true|false,"reason":"string"},"recommendation":{"safe":true|false,"reason":"string"}}],"totalDetected":number}. Use Bahasa Indonesia for all descriptive text fields. "risk" must be 1-3 concise sentences, "severityReason" must justify the selected severity, "pregnancy.reason" must explain pregnancy safety, and "recommendation.reason" must explain buy recommendation. Deterministic rule: any item in riskyIngredients must have recommendation.safe=false.',
           },
           {
             role: "user",
             content: buildPrompt(text),
           },
         ],
-        temperature: 0.1,
+        temperature: 0,
+        top_p: 1,
         max_tokens: 500,
         stream: false,
       }),
