@@ -13,6 +13,8 @@ function buildPrompt(ingredientText) {
     "- detectedIngredients must contain ONLY real ingredient names explicitly present in input text.",
     "- detectedIngredients must NOT include random words, labels, marketing text, product claims, or non-ingredient tokens.",
     "- If a token is unclear or not confidently a real ingredient, EXCLUDE it.",
+    "- If one ingredient appears in multiple languages/spellings, keep only one representative name.",
+    "- Language priority for representative name: Bahasa Indonesia first, then English.",
     "- riskyIngredients must be subset of detectedIngredients.",
     "- riskyIngredients can be empty array.",
     "- totalDetected must equal detectedIngredients.length.",
@@ -49,6 +51,132 @@ function extractJsonArrayChunk(rawText) {
   return text.slice(start, end + 1);
 }
 
+function extractJsonObjectChunk(rawText) {
+  const text = String(rawText || "");
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) {
+    return "";
+  }
+  return text.slice(start, end + 1);
+}
+
+function extractFencedJsonChunk(rawText) {
+  const text = String(rawText || "");
+  const match = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (!match || !match[1]) {
+    return "";
+  }
+  return String(match[1]).trim();
+}
+
+function extractQuotedStringArrays(rawText) {
+  const text = String(rawText || "");
+  const matches = text.match(/\[[^\[\]]+\]/g) || [];
+  const arrays = [];
+
+  for (const chunk of matches) {
+    const normalized = chunk.replace(/'/g, '"');
+    try {
+      const parsed = JSON.parse(normalized);
+      if (Array.isArray(parsed) && parsed.every((item) => typeof item === "string")) {
+        arrays.push(parsed);
+      }
+    } catch (error) {
+      // ignore non-JSON arrays
+    }
+  }
+
+  return arrays;
+}
+
+function parseTokenListFromModelContent(content, candidateKeyMap) {
+  let parsed = null;
+  const trimmedContent = String(content || "").trim();
+  if (!trimmedContent) {
+    return [];
+  }
+
+  try {
+    parsed = JSON.parse(trimmedContent);
+  } catch (error) {
+    parsed = null;
+  }
+
+  if (!parsed) {
+    const fenced = extractFencedJsonChunk(trimmedContent);
+    if (fenced) {
+      try {
+        parsed = JSON.parse(fenced);
+      } catch (error) {
+        parsed = null;
+      }
+    }
+  }
+
+  if (!parsed) {
+    const arrayChunk = extractJsonArrayChunk(trimmedContent);
+    if (arrayChunk) {
+      try {
+        parsed = JSON.parse(arrayChunk);
+      } catch (error) {
+        parsed = null;
+      }
+    }
+  }
+
+  if (!parsed) {
+    const objectChunk = extractJsonObjectChunk(trimmedContent);
+    if (objectChunk) {
+      try {
+        parsed = JSON.parse(objectChunk);
+      } catch (error) {
+        parsed = null;
+      }
+    }
+  }
+
+  let list = [];
+  if (Array.isArray(parsed)) {
+    list = parsed;
+  } else if (parsed && typeof parsed === "object") {
+    const candidatesFromObject =
+      parsed.detectedIngredients ||
+      parsed.ingredients ||
+      parsed.validIngredients ||
+      parsed.result ||
+      parsed.data;
+    if (Array.isArray(candidatesFromObject)) {
+      list = candidatesFromObject;
+    }
+  }
+
+  if (!Array.isArray(list) || list.length === 0) {
+    const fallbackArrays = extractQuotedStringArrays(trimmedContent);
+    if (fallbackArrays.length > 0) {
+      list = fallbackArrays[fallbackArrays.length - 1];
+    }
+  }
+
+  if (!Array.isArray(list) || list.length === 0) {
+    return [];
+  }
+
+  const unique = [];
+  const seen = new Set();
+  for (const item of list) {
+    const value = String(item || "").trim();
+    const key = normalizeTokenKey(value);
+    if (!key || seen.has(key) || !candidateKeyMap.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    unique.push(candidateKeyMap.get(key));
+  }
+
+  return unique;
+}
+
 async function refineDetectedIngredientsWithAI(ingredientText, candidates = []) {
   if (!HF_API_TOKEN) {
     return [];
@@ -71,6 +199,7 @@ async function refineDetectedIngredientsWithAI(ingredientText, candidates = []) 
     "From candidate tokens, keep ONLY tokens that are actual cosmetic ingredients.",
     "Exclude random words, commands, labels, company names, addresses, marketing/legal text, and non-ingredient tokens.",
     "If uncertain whether a token is a real ingredient, exclude it.",
+    "If equivalent ingredients appear in multiple languages/spellings, keep only one name with language priority: Bahasa Indonesia first, then English.",
     "Return ONLY valid JSON array of strings.",
     "",
     `Ingredient text: ${ingredientText}`,
@@ -93,7 +222,7 @@ async function refineDetectedIngredientsWithAI(ingredientText, candidates = []) 
           {
             role: "system",
             content:
-              'You validate cosmetic ingredient tokens. Return ONLY a JSON array of strings. Keep only real cosmetic ingredients from candidate tokens. Exclude random/non-ingredient text, and if uncertain exclude.',
+              'You validate cosmetic ingredient tokens. Return ONLY a JSON array of strings. Keep only real cosmetic ingredients from candidate tokens. Exclude random/non-ingredient text, and if uncertain exclude. If same ingredient appears in multiple languages/spellings, return one representative using language priority: Bahasa Indonesia first, then English.',
           },
           {
             role: "user",
@@ -118,22 +247,6 @@ async function refineDetectedIngredientsWithAI(ingredientText, candidates = []) 
       return [];
     }
 
-    const arrayChunk = extractJsonArrayChunk(content);
-    if (!arrayChunk) {
-      return [];
-    }
-
-    let parsed = [];
-    try {
-      parsed = JSON.parse(arrayChunk);
-    } catch (error) {
-      return [];
-    }
-
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-
     const candidateKeyMap = new Map();
     for (const candidate of cleanedCandidates) {
       const key = normalizeTokenKey(candidate);
@@ -142,19 +255,78 @@ async function refineDetectedIngredientsWithAI(ingredientText, candidates = []) 
       }
     }
 
-    const unique = [];
-    const seen = new Set();
-    for (const item of parsed) {
-      const value = String(item || "").trim();
-      const key = normalizeTokenKey(value);
-      if (!key || seen.has(key) || !candidateKeyMap.has(key)) {
-        continue;
-      }
-      seen.add(key);
-      unique.push(candidateKeyMap.get(key));
+    const baseList = parseTokenListFromModelContent(content, candidateKeyMap);
+    if (baseList.length === 0) {
+      return [];
     }
 
-    return unique;
+    const collapsePrompt = [
+      "You normalize ingredient names from multiple languages/spellings.",
+      "Merge equivalent ingredients and keep one representative name only.",
+      "Representative name priority: Bahasa Indonesia first, then English.",
+      "Return ONLY valid JSON array of strings.",
+      "",
+      `Ingredient text: ${ingredientText}`,
+      `Validated ingredients: ${JSON.stringify(baseList)}`,
+    ].join("\n");
+
+    const collapseResponse = await fetch(HF_CHAT_ENDPOINT, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${HF_API_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: HF_MODEL_ID,
+        messages: [
+          {
+            role: "system",
+            content:
+              "Normalize equivalent ingredient names across languages/spellings and keep one representative with language priority: Bahasa Indonesia first, then English. Return ONLY JSON array.",
+          },
+          {
+            role: "user",
+            content: collapsePrompt,
+          },
+        ],
+        temperature: 0,
+        top_p: 1,
+        max_tokens: 260,
+        stream: false,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!collapseResponse.ok) {
+      return baseList;
+    }
+
+    let collapsePayload = null;
+    try {
+      collapsePayload = await collapseResponse.json();
+    } catch (error) {
+      collapsePayload = null;
+    }
+
+    const collapsedContent = collapsePayload?.choices?.[0]?.message?.content;
+    if (typeof collapsedContent !== "string") {
+      return baseList;
+    }
+
+    const collapseKeyMap = new Map();
+    for (const item of baseList) {
+      const key = normalizeTokenKey(item);
+      if (key && !collapseKeyMap.has(key)) {
+        collapseKeyMap.set(key, item);
+      }
+    }
+
+    const collapsedList = parseTokenListFromModelContent(collapsedContent, collapseKeyMap);
+    if (collapsedList.length === 0) {
+      return baseList;
+    }
+
+    return collapsedList;
   } catch (error) {
     return [];
   } finally {
@@ -187,7 +359,7 @@ async function analyzeIngredients(text) {
           {
             role: "system",
             content:
-              'You are a cosmetic safety analyzer. Return ONLY valid JSON with structure {"detectedIngredients":["string"],"riskyIngredients":[{"name":"string","aliases":["string"],"risk":"string","severity":"high|medium|low","severityReason":"string","pregnancy":{"safe":true|false,"reason":"string"},"recommendation":{"safe":true|false,"reason":"string"}}],"totalDetected":number}. Use Bahasa Indonesia for all descriptive text fields. detectedIngredients must contain only valid ingredient names explicitly present in input text; exclude random words/non-ingredient tokens if uncertain. riskyIngredients must be a subset of detectedIngredients. Never include company/brand/address/BPOM/batch/legal text as ingredients. "risk" must be 1-3 concise sentences, "severityReason" must justify the selected severity, "pregnancy.reason" must explain pregnancy safety, and "recommendation.reason" must explain buy recommendation. recommendation.safe is false only for clearly dangerous/prohibited ingredients or likely high-concentration high risk; otherwise it may be true with caution.',
+              'You are a cosmetic safety analyzer. Return ONLY valid JSON with structure {"detectedIngredients":["string"],"riskyIngredients":[{"name":"string","aliases":["string"],"risk":"string","severity":"high|medium|low","severityReason":"string","pregnancy":{"safe":true|false,"reason":"string"},"recommendation":{"safe":true|false,"reason":"string"}}],"totalDetected":number}. Use Bahasa Indonesia for all descriptive text fields. detectedIngredients must contain only valid ingredient names explicitly present in input text; exclude random words/non-ingredient tokens if uncertain. If the same ingredient appears in multiple languages/spellings, keep one representative name with priority Bahasa Indonesia then English. riskyIngredients must be a subset of detectedIngredients and use the same representative naming. Never include company/brand/address/BPOM/batch/legal text as ingredients. "risk" must be 1-3 concise sentences, "severityReason" must justify the selected severity, "pregnancy.reason" must explain pregnancy safety, and "recommendation.reason" must explain buy recommendation. recommendation.safe is false only for clearly dangerous/prohibited ingredients or likely high-concentration high risk; otherwise it may be true with caution.',
           },
           {
             role: "user",

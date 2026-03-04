@@ -1,3 +1,9 @@
+const {
+  isDatasetDangerousIngredient,
+  getDatasetCanonicalKey,
+} = require('./ingredientDataset');
+const { isKnownNonIngredient } = require('./nonIngredientMemory');
+
 const NON_INGREDIENT_PATTERNS = [
   /\bmade in\b/i,
   /\bmadein\b/i,
@@ -56,7 +62,7 @@ const CANONICAL_ALIASES = {
   alcohol: ['ethanol', 'ethyl alcohol', 'alcohol denat', 'denatured alcohol'],
   'sodium benzoate': ['natrium benzoat'],
   fragrance: ['parfum', 'perfume'],
-  phenoxyethanol: [],
+  phenoxyethanol: ['fenoksietanol'],
   'salicylic acid': ['asam salisilat', 'bha'],
   'benzyl alcohol': [],
   'benzoic acid': ['asam benzoat'],
@@ -89,8 +95,13 @@ const CONDITIONAL_CAUTION_KEYS = new Set([
   'paraben',
 ]);
 
+const MINERAL_FILTER_CONTEXTUAL_KEYS = new Set([
+  'zinc oxide',
+  'titanium dioxide',
+]);
+
 function isKnownRiskKey(key) {
-  return DEFINITELY_DANGEROUS_KEYS.has(key) || CONDITIONAL_CAUTION_KEYS.has(key);
+  return isHardDangerousKey(key) || CONDITIONAL_CAUTION_KEYS.has(key);
 }
 
 const ALIAS_TO_CANONICAL = Object.entries(CANONICAL_ALIASES).reduce((acc, [canonical, aliases]) => {
@@ -111,7 +122,38 @@ function normalizeKey(value) {
 
 function canonicalKey(value) {
   const key = normalizeKey(value);
+  const datasetCanonical = getDatasetCanonicalKey(value);
+  if (datasetCanonical) {
+    return datasetCanonical;
+  }
+
   return ALIAS_TO_CANONICAL[key] || key;
+}
+
+function isHardDangerousKey(nameOrKey) {
+  const key = canonicalKey(nameOrKey);
+  if (DEFINITELY_DANGEROUS_KEYS.has(key)) {
+    return true;
+  }
+
+  return isDatasetDangerousIngredient(nameOrKey) || isDatasetDangerousIngredient(key);
+}
+
+function choosePreferredLanguageName(canonical, variants = []) {
+  const cleanedVariants = variants
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+
+  if (cleanedVariants.length === 0) {
+    return '';
+  }
+
+  const canonicalHit = cleanedVariants.find((name) => normalizeKey(name) === canonical);
+  if (canonicalHit) {
+    return canonicalHit;
+  }
+
+  return cleanedVariants[0];
 }
 
 function clampSeverity(value) {
@@ -124,6 +166,10 @@ function clampSeverity(value) {
 
 function isLikelyIngredient(token) {
   if (!token || token.length < 2 || token.length > 80) {
+    return false;
+  }
+
+  if (isKnownNonIngredient(token)) {
     return false;
   }
 
@@ -187,6 +233,15 @@ function extractIngredientSection(ingredientText) {
   return section.slice(0, breakMatch.index);
 }
 
+function hasAirborneExposureHint(text) {
+  const value = String(text || '').toLowerCase();
+  if (!value) {
+    return false;
+  }
+
+  return /\b(spray|aerosol|mist|powder|serbuk|inhalation|hirup|di hirup)\b/i.test(value);
+}
+
 function extractDetectedIngredients(ingredientText) {
   if (typeof ingredientText !== 'string') {
     return [];
@@ -195,6 +250,7 @@ function extractDetectedIngredients(ingredientText) {
   const sourceSection = extractIngredientSection(ingredientText);
   const cleaned = sourceSection
     .replace(/ingredients?|komposisi|kandungan\s*:/gi, '')
+    .replace(/\([^)]*\)/g, ' ')
     .replace(/[()\[\]]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -211,23 +267,28 @@ function extractDetectedIngredients(ingredientText) {
     .map(stripTrailingMetadata)
     .map((part) => part.replace(/\s{2,}/g, ' '));
 
-  const unique = [];
-  const seen = new Set();
+  const grouped = new Map();
+  const order = [];
   for (const item of rawItems) {
     if (!isLikelyIngredient(item)) {
       continue;
     }
 
     const key = canonicalKey(item);
-    if (!key || seen.has(key)) {
+    if (!key) {
       continue;
     }
 
-    seen.add(key);
-    unique.push(item);
+    if (!grouped.has(key)) {
+      grouped.set(key, []);
+      order.push(key);
+    }
+    grouped.get(key).push(item);
   }
 
-  return unique;
+  return order
+    .map((key) => choosePreferredLanguageName(key, grouped.get(key)))
+    .filter(Boolean);
 }
 
 function sanitizeDetectedIngredientsFromAI(rawDetectedIngredients, ingredientSection = '') {
@@ -237,8 +298,8 @@ function sanitizeDetectedIngredientsFromAI(rawDetectedIngredients, ingredientSec
 
   const section = String(ingredientSection || '');
   const normalizedSource = normalizeKey(section);
-  const unique = [];
-  const seen = new Set();
+  const grouped = new Map();
+  const order = [];
 
   for (const raw of rawDetectedIngredients) {
     const cleaned = stripTrailingMetadata(String(raw || '').trim()).replace(/\s+/g, ' ').trim();
@@ -247,7 +308,7 @@ function sanitizeDetectedIngredientsFromAI(rawDetectedIngredients, ingredientSec
     }
 
     const key = canonicalKey(cleaned);
-    if (!key || seen.has(key)) {
+    if (!key) {
       continue;
     }
 
@@ -258,11 +319,49 @@ function sanitizeDetectedIngredientsFromAI(rawDetectedIngredients, ingredientSec
       }
     }
 
-    seen.add(key);
-    unique.push(cleaned);
+    if (!grouped.has(key)) {
+      grouped.set(key, []);
+      order.push(key);
+    }
+    grouped.get(key).push(cleaned);
   }
 
-  return unique;
+  return order
+    .map((key) => choosePreferredLanguageName(key, grouped.get(key)))
+    .filter(Boolean);
+}
+
+function mergeDetectedIngredients(baseDetected = [], aiDetected = []) {
+  const grouped = new Map();
+  const order = [];
+
+  const combined = [
+    ...(Array.isArray(baseDetected) ? baseDetected : []),
+    ...(Array.isArray(aiDetected) ? aiDetected : []),
+  ];
+
+  for (const raw of combined) {
+    const cleaned = String(raw || '').trim();
+    if (!cleaned) {
+      continue;
+    }
+
+    const key = canonicalKey(cleaned);
+    if (!key) {
+      continue;
+    }
+
+    if (!grouped.has(key)) {
+      grouped.set(key, []);
+      order.push(key);
+    }
+
+    grouped.get(key).push(cleaned);
+  }
+
+  return order
+    .map((key) => choosePreferredLanguageName(key, grouped.get(key)))
+    .filter(Boolean);
 }
 
 function escapeRegex(value) {
@@ -298,6 +397,26 @@ function isIngredientMentionedInSource(item, detectedKeySet, ingredientText) {
     if (normalizedSource && regex.test(normalizedSource)) {
       return true;
     }
+  }
+
+  return false;
+}
+
+function shouldKeepAiRiskItem(item) {
+  const key = canonicalKey(item?.name);
+  if (isKnownRiskKey(key)) {
+    return true;
+  }
+
+  const aliases = Array.isArray(item?.aliases) ? item.aliases : [];
+  for (const alias of aliases) {
+    if (isKnownRiskKey(canonicalKey(alias))) {
+      return true;
+    }
+  }
+
+  if (isDatasetDangerousIngredient(item?.name)) {
+    return true;
   }
 
   return false;
@@ -436,6 +555,29 @@ function buildDetectedIngredientIndex(detectedIngredients) {
   return indexMap;
 }
 
+function buildDetectedNameMap(detectedIngredients) {
+  const nameMap = new Map();
+  for (const item of detectedIngredients) {
+    const key = canonicalKey(item);
+    if (key && !nameMap.has(key)) {
+      nameMap.set(key, item);
+    }
+  }
+  return nameMap;
+}
+
+function resolveRiskKeyFromDetected(item, detectedNameMap) {
+  const candidates = [item?.name, ...(Array.isArray(item?.aliases) ? item.aliases : [])];
+  for (const candidate of candidates) {
+    const key = canonicalKey(candidate);
+    if (key && detectedNameMap.has(key)) {
+      return key;
+    }
+  }
+
+  return canonicalKey(item?.name);
+}
+
 function findIngredientIndex(item, detectedIndexMap) {
   const candidates = [item.name, ...(Array.isArray(item.aliases) ? item.aliases : [])];
   let best = Number.POSITIVE_INFINITY;
@@ -462,7 +604,7 @@ function hasHighConcentrationHint(item, ingredientIndex, key = '') {
 
 function computeRecommendation(item, ingredientIndex) {
   const key = canonicalKey(item.name);
-  const definitelyDangerous = DEFINITELY_DANGEROUS_KEYS.has(key);
+  const definitelyDangerous = isHardDangerousKey(key);
   const conditional = CONDITIONAL_CAUTION_KEYS.has(key);
   const highConcentrationLikely = hasHighConcentrationHint(item, ingredientIndex, key);
 
@@ -518,7 +660,7 @@ function applyDeterministicRiskProfile(item, ingredientIndex) {
   const highConcentrationLikely = hasHighConcentrationHint(item, ingredientIndex, key);
   const profiled = { ...item };
 
-  if (DEFINITELY_DANGEROUS_KEYS.has(key)) {
+  if (isHardDangerousKey(key)) {
     profiled.severity = 'high';
     if (isGenericRiskText(profiled.risk)) {
       profiled.risk =
@@ -600,19 +742,26 @@ function normalizeRecommendationReason(aiReason, safeValue, fallbackReason) {
 }
 
 function extractJsonChunk(rawText) {
-  const text = String(rawText || '');
-  const arrayStart = text.indexOf('[');
-  const arrayEnd = text.lastIndexOf(']');
+  const text = String(rawText || '').trim();
+  if (!text) {
+    return '';
+  }
 
-  if (arrayStart !== -1 && arrayEnd !== -1 && arrayEnd > arrayStart) {
-    return text.slice(arrayStart, arrayEnd + 1);
+  const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenceMatch && fenceMatch[1]) {
+    return extractJsonChunk(fenceMatch[1]);
   }
 
   const objectStart = text.indexOf('{');
   const objectEnd = text.lastIndexOf('}');
-
   if (objectStart !== -1 && objectEnd !== -1 && objectEnd > objectStart) {
     return text.slice(objectStart, objectEnd + 1);
+  }
+
+  const arrayStart = text.indexOf('[');
+  const arrayEnd = text.lastIndexOf(']');
+  if (arrayStart !== -1 && arrayEnd !== -1 && arrayEnd > arrayStart) {
+    return text.slice(arrayStart, arrayEnd + 1);
   }
 
   return '';
@@ -696,7 +845,19 @@ function mergeRiskyIngredients(items) {
     }
   }
 
-  return Array.from(merged.values());
+  return Array.from(merged.values()).map((item) => {
+    const key = canonicalKey(item.name);
+    const preferredName = choosePreferredLanguageName(key, [item.name, ...item.aliases]);
+    const aliases = sanitizeAliases([item.name, ...item.aliases]).filter(
+      (alias) => canonicalKey(alias) !== canonicalKey(preferredName)
+    );
+
+    return {
+      ...item,
+      name: preferredName,
+      aliases,
+    };
+  });
 }
 
 function parseAIResponse(rawText, ingredientText = '') {
@@ -748,13 +909,23 @@ function parseAIResponse(rawText, ingredientText = '') {
   }
 
   const detectedFromAI = sanitizeDetectedIngredientsFromAI(rawDetectedIngredients, ingredientSection);
-  const detectedIngredients = detectedFromAI.length > 0 ? detectedFromAI : detectedFromText;
+  const detectedIngredients = mergeDetectedIngredients(detectedFromText, detectedFromAI);
 
   const normalizedRisky = rawIngredients.map(normalizeIngredient).filter(Boolean);
   const riskyIngredientsMerged = mergeRiskyIngredients(normalizedRisky);
   const detectedKeySet = buildDetectedKeySet(detectedIngredients);
+  const airborneExposureHint = hasAirborneExposureHint(ingredientSection);
   const riskyIngredientsInputMatched = riskyIngredientsMerged.filter((item) => {
     if (!isLikelyIngredient(item.name)) {
+      return false;
+    }
+
+    if (!shouldKeepAiRiskItem(item)) {
+      return false;
+    }
+
+    const key = canonicalKey(item.name);
+    if (MINERAL_FILTER_CONTEXTUAL_KEYS.has(key) && !airborneExposureHint) {
       return false;
     }
 
@@ -765,9 +936,18 @@ function parseAIResponse(rawText, ingredientText = '') {
     return isIngredientMentionedInSource(item, detectedKeySet, ingredientSection);
   });
   const detectedIndexMap = buildDetectedIngredientIndex(detectedIngredients);
+  const detectedNameMap = buildDetectedNameMap(detectedIngredients);
   const riskyMap = new Map();
   for (const item of riskyIngredientsInputMatched) {
-    riskyMap.set(canonicalKey(item.name), item);
+    const resolvedKey = resolveRiskKeyFromDetected(item, detectedNameMap);
+    if (!resolvedKey) {
+      continue;
+    }
+
+    riskyMap.set(resolvedKey, {
+      ...item,
+      name: detectedNameMap.get(resolvedKey) || item.name,
+    });
   }
 
   for (const ingredient of detectedIngredients) {

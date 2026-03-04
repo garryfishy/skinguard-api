@@ -1,0 +1,140 @@
+{
+  "version": 1,
+  "items": {
+    "super": {
+      "token": "super",
+      "normalizedKey": "super",
+      "count": 3,
+      "reasons": {
+        "weak_token": 2,
+        "pipeline_rejected_candidate": 1
+      },
+      "firstSeenAt": "2026-03-04T08:54:31.449Z",
+      "updatedAt": "2026-03-04T09:02:30.092Z"
+    },
+    "acucar": {
+      "token": "acucar",
+      "normalizedKey": "acucar",
+      "count": 3,
+      "reasons": {
+        "weak_token": 2,
+        "pipeline_rejected_candidate": 1
+      },
+      "firstSeenAt": "2026-03-04T08:54:31.453Z",
+      "updatedAt": "2026-03-04T09:02:30.094Z"
+    },
+    "canview": {
+      "token": "canview",
+      "normalizedKey": "canview",
+      "count": 2,
+      "reasons": {
+        "no_dataset_or_pubchem_match": 1,
+        "pipeline_rejected_candidate": 1
+      },
+      "firstSeenAt": "2026-03-04T08:54:32.248Z",
+      "updatedAt": "2026-03-04T09:02:30.091Z"
+    },
+    "gayung": {
+      "token": "Gayung",
+      "normalizedKey": "gayung",
+      "count": 2,
+      "reasons": {
+        "pipeline_rejected_candidate": 2
+      },
+      "firstSeenAt": "2026-03-04T09:02:24.098Z",
+      "updatedAt": "2026-03-04T09:02:44.394Z"
+    },
+    "gelas": {
+      "token": "Gelas",
+      "normalizedKey": "gelas",
+      "count": 2,
+      "reasons": {
+        "pipeline_rejected_candidate": 2
+      },
+      "firstSeenAt": "2026-03-04T09:02:24.099Z",
+      "updatedAt": "2026-03-04T09:02:44.395Z"
+    },
+    "sendok": {
+      "token": "Sendok",
+      "normalizedKey": "sendok",
+      "count": 2,
+      "reasons": {
+        "pipeline_rejected_candidate": 2
+      },
+      "firstSeenAt": "2026-03-04T09:02:24.100Z",
+      "updatedAt": "2026-03-04T09:02:44.395Z"
+    },
+    "sikat gigi": {
+      "token": "Sikat gigi",
+      "normalizedKey": "sikat gigi",
+      "count": 2,
+      "reasons": {
+        "pipeline_rejected_candidate": 2
+      },
+      "firstSeenAt": "2026-03-04T09:02:24.101Z",
+      "updatedAt": "2026-03-04T09:02:44.396Z"
+    },
+    "ember": {
+      "token": "Ember",
+      "normalizedKey": "ember",
+      "count": 2,
+      "reasons": {
+        "pipeline_rejected_candidate": 2
+      },
+      "firstSeenAt": "2026-03-04T09:02:24.101Z",
+      "updatedAt": "2026-03-04T09:02:44.397Z"
+    },
+    "piring": {
+      "token": "Piring",
+      "normalizedKey": "piring",
+      "count": 2,
+      "reasons": {
+        "pipeline_rejected_candidate": 2
+      },
+      "firstSeenAt": "2026-03-04T09:02:24.102Z",
+      "updatedAt": "2026-03-04T09:02:44.398Z"
+    },
+    "botol plastik": {
+      "token": "Botol plastik",
+      "normalizedKey": "botol plastik",
+      "count": 2,
+      "reasons": {
+        "pipeline_rejected_candidate": 2
+      },
+      "firstSeenAt": "2026-03-04T09:02:24.103Z",
+      "updatedAt": "2026-03-04T09:02:44.398Z"
+    },
+    "handuk": {
+      "token": "Handuk",
+      "normalizedKey": "handuk",
+      "count": 2,
+      "reasons": {
+        "pipeline_rejected_candidate": 2
+      },
+      "firstSeenAt": "2026-03-04T09:02:24.103Z",
+      "updatedAt": "2026-03-04T09:02:44.399Z"
+    },
+    "net 150 ml": {
+      "token": "NET 150 ML",
+      "normalizedKey": "net 150 ml",
+      "count": 2,
+      "reasons": {
+        "empty_candidate": 1,
+        "pipeline_rejected_candidate": 1
+      },
+      "firstSeenAt": "2026-03-04T09:02:26.992Z",
+      "updatedAt": "2026-03-04T09:02:30.095Z"
+    },
+    "manufactured by pt abc": {
+      "token": "Manufactured by PT ABC",
+      "normalizedKey": "manufactured by pt abc",
+      "count": 2,
+      "reasons": {
+        "empty_candidate": 1,
+        "pipeline_rejected_candidate": 1
+      },
+      "firstSeenAt": "2026-03-04T09:02:26.992Z",
+      "updatedAt": "2026-03-04T09:02:30.096Z"
+    }
+  }
+}

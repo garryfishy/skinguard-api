@@ -1,10 +1,23 @@
 const PUBCHEM_BASE_URL = 'https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name';
 const PUBCHEM_GHS_BASE_URL = 'https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound';
+const {
+  isDatasetIngredient,
+  isDatasetDangerousIngredient,
+} = require('./ingredientDataset');
+const {
+  isKnownNonIngredient,
+  recordNonIngredient,
+} = require('./nonIngredientMemory');
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const LOOKUP_TIMEOUT_MS = 2500;
 const MAX_ONLINE_LOOKUPS = 120;
 const LOOKUP_CONCURRENCY = 6;
 const DEFAULT_SAFETY_RECHECK_BUDGET = 4;
+const CANDIDATE_VALIDITY = Object.freeze({
+  VALID: 'valid',
+  INVALID: 'invalid',
+  UNKNOWN: 'unknown',
+});
 
 const HIGH_IMPACT_GHS_CODES = new Set([
   'H300',
@@ -40,51 +53,6 @@ const CAUTION_GHS_CODES = new Set([
 ]);
 
 const ALWAYS_RISKY_KEYS = new Set([
-  'mercury',
-  'merkuri',
-  'raksa',
-  'mercury chloride',
-  'hydroquinone',
-  'hidrokuinon',
-  'lead',
-  'timbal',
-  'arsenic',
-  'rhodamine b',
-  'tretinoin',
-  'retinoic acid',
-  'clobetasol',
-  'clobetasol propionate',
-]);
-
-const KNOWN_INGREDIENT_KEYS = new Set([
-  'water',
-  'aqua',
-  'glycerin',
-  'niacinamide',
-  'dimethicone',
-  'hyaluronic acid',
-  'aloe vera extract',
-  'aloe barbadensis leaf extract',
-  'fragrance',
-  'parfum',
-  'perfume',
-  'alcohol',
-  'ethanol',
-  'ethyl alcohol',
-  'alcohol denat',
-  'sodium benzoate',
-  'natrium benzoat',
-  'phenoxyethanol',
-  'salicylic acid',
-  'asam salisilat',
-  'benzyl alcohol',
-  'benzoic acid',
-  'potassium sorbate',
-  'sorbic acid',
-  'paraben',
-  'methylparaben',
-  'propylparaben',
-  'butylparaben',
   'mercury',
   'merkuri',
   'raksa',
@@ -141,6 +109,10 @@ function isLikelyIngredient(value) {
     return false;
   }
 
+  if (isKnownNonIngredient(text)) {
+    return false;
+  }
+
   const compact = text.toLowerCase().replace(/[^a-z0-9]/g, '');
   if (
     /^(netto?|net)\d+(ml|l|g|kg|oz)$/i.test(compact) ||
@@ -185,6 +157,10 @@ function isWeakUntrustedToken(value) {
   return token.length <= 6;
 }
 
+function isKnownIngredientCandidate(candidate) {
+  return isDatasetIngredient(candidate);
+}
+
 function buildCandidateList(name, aliases = []) {
   const raw = [name, ...aliases];
   const unique = [];
@@ -206,24 +182,6 @@ function buildCandidateList(name, aliases = []) {
   }
 
   return unique.slice(0, 5);
-}
-
-function getCachedResult(key) {
-  const cached = validationCache.get(key);
-  if (!cached) {
-    return null;
-  }
-
-  if (Date.now() - cached.ts > CACHE_TTL_MS) {
-    validationCache.delete(key);
-    return null;
-  }
-
-  return cached.value;
-}
-
-function setCachedResult(key, value) {
-  validationCache.set(key, { value, ts: Date.now() });
 }
 
 function getCachedValue(cache, key) {
@@ -342,7 +300,7 @@ async function lookupGhsCodesByCid(cid) {
 
 function isRiskyByRule(candidates) {
   for (const candidate of candidates) {
-    if (ALWAYS_RISKY_KEYS.has(normalizeKey(candidate))) {
+    if (ALWAYS_RISKY_KEYS.has(normalizeKey(candidate)) || isDatasetDangerousIngredient(candidate)) {
       return true;
     }
   }
@@ -451,7 +409,7 @@ async function lookupPubChem(name) {
     return false;
   }
 
-  const cached = getCachedResult(key);
+  const cached = getCachedValue(validationCache, key);
   if (cached !== null) {
     return cached;
   }
@@ -464,7 +422,7 @@ async function lookupPubChem(name) {
     const res = await fetch(url, { signal: controller.signal });
 
     if (res.status === 404 || res.status === 400) {
-      setCachedResult(key, false);
+      setCachedValue(validationCache, key, false);
       return false;
     }
 
@@ -479,7 +437,7 @@ async function lookupPubChem(name) {
       Array.isArray(payload.IdentifierList.CID) &&
       payload.IdentifierList.CID.length > 0;
 
-    setCachedResult(key, Boolean(hasCid));
+    setCachedValue(validationCache, key, Boolean(hasCid));
     return Boolean(hasCid);
   } catch (error) {
     return null;
@@ -490,18 +448,21 @@ async function lookupPubChem(name) {
 
 async function verifyIngredientCandidates(candidates, budget) {
   if (candidates.length === 0) {
-    return false;
+    return CANDIDATE_VALIDITY.INVALID;
+  }
+
+  if (candidates.some((candidate) => isKnownNonIngredient(candidate))) {
+    return CANDIDATE_VALIDITY.INVALID;
   }
 
   for (const candidate of candidates) {
-    const key = normalizeKey(candidate);
-    if (KNOWN_INGREDIENT_KEYS.has(key)) {
-      return true;
+    if (isKnownIngredientCandidate(candidate)) {
+      return CANDIDATE_VALIDITY.VALID;
     }
   }
 
   if (isWeakUntrustedToken(candidates[0])) {
-    return false;
+    return CANDIDATE_VALIDITY.INVALID;
   }
 
   let hasUnknown = false;
@@ -513,7 +474,7 @@ async function verifyIngredientCandidates(candidates, budget) {
     budget.remaining -= 1;
     const result = await lookupPubChem(candidate);
     if (result === true) {
-      return true;
+      return CANDIDATE_VALIDITY.VALID;
     }
     if (result === null) {
       hasUnknown = true;
@@ -521,10 +482,10 @@ async function verifyIngredientCandidates(candidates, budget) {
   }
 
   if (hasUnknown) {
-    return isLikelyIngredient(candidates[0]);
+    return CANDIDATE_VALIDITY.UNKNOWN;
   }
 
-  return false;
+  return CANDIDATE_VALIDITY.INVALID;
 }
 
 async function mapWithConcurrency(items, limit, mapper) {
@@ -579,18 +540,28 @@ async function verifyParsedIngredientsOnline(parsedData) {
     return parsedData;
   }
 
-  const trustSafeFromAI = Boolean(parsedData.aiDetectedValidated);
   const budget = { remaining: MAX_ONLINE_LOOKUPS };
-  let removedCount = 0;
+  let removedInvalidCount = 0;
+  let removedUnknownCount = 0;
 
   const riskyInput = Array.isArray(parsedData.riskyIngredients) ? parsedData.riskyIngredients : [];
   const safeInput = Array.isArray(parsedData.safeIngredients) ? parsedData.safeIngredients : [];
 
   const riskyChecks = await mapWithConcurrency(riskyInput, LOOKUP_CONCURRENCY, async (item) => {
     const candidates = buildCandidateList(item?.name, item?.aliases);
-    const valid = await verifyIngredientCandidates(candidates, budget);
-    if (!valid) {
-      removedCount += 1;
+    if (candidates.length === 0) {
+      recordNonIngredient(item?.name, 'empty_candidate');
+      removedInvalidCount += 1;
+      return null;
+    }
+
+    const validity = await verifyIngredientCandidates(candidates, budget);
+    if (validity !== CANDIDATE_VALIDITY.VALID) {
+      if (validity === CANDIDATE_VALIDITY.UNKNOWN) {
+        removedUnknownCount += 1;
+      } else {
+        removedInvalidCount += 1;
+      }
       return null;
     }
 
@@ -604,29 +575,41 @@ async function verifyParsedIngredientsOnline(parsedData) {
   const verifiedRisky = riskyChecks.filter(Boolean);
   const riskyKeys = new Set(verifiedRisky.map((item) => normalizeKey(item.name)));
 
-  const verifiedSafe = trustSafeFromAI
-    ? dedupeStrings(safeInput).filter((name) => !riskyKeys.has(normalizeKey(name)))
-    : dedupeStrings(
-        (
-          await mapWithConcurrency(safeInput, LOOKUP_CONCURRENCY, async (name) => {
-            const candidates = buildCandidateList(name, []);
-            const valid = await verifyIngredientCandidates(candidates, budget);
-            if (!valid) {
-              removedCount += 1;
-              return null;
-            }
+  const verifiedSafe = dedupeStrings(
+    (
+      await mapWithConcurrency(safeInput, LOOKUP_CONCURRENCY, async (name) => {
+        const candidates = buildCandidateList(name, []);
+        if (candidates.length === 0) {
+          recordNonIngredient(name, 'empty_candidate');
+          removedInvalidCount += 1;
+          return null;
+        }
 
-            return canonicalizeText(name);
-          })
-        ).filter(Boolean)
-      ).filter((name) => !riskyKeys.has(normalizeKey(name)));
+        const validity = await verifyIngredientCandidates(candidates, budget);
+        if (validity !== CANDIDATE_VALIDITY.VALID) {
+          if (validity === CANDIDATE_VALIDITY.UNKNOWN) {
+            removedUnknownCount += 1;
+          } else {
+            removedInvalidCount += 1;
+          }
+          return null;
+        }
+
+        return canonicalizeText(name);
+      })
+    ).filter(Boolean)
+  ).filter((name) => !riskyKeys.has(normalizeKey(name)));
   const totalDetected = verifiedRisky.length + verifiedSafe.length;
   const safeCount = verifiedSafe.length;
   const summary = recomputeSummary(verifiedRisky.length, totalDetected);
 
   let warning = parsedData.warning ? String(parsedData.warning) : '';
-  if (removedCount > 0) {
-    const extra = `${removedCount} item dihapus karena tidak terverifikasi sebagai bahan (ingredient).`;
+  if (removedInvalidCount > 0) {
+    const extra = `${removedInvalidCount} item dihapus karena tidak terverifikasi sebagai bahan (ingredient).`;
+    warning = warning ? `${warning} ${extra}` : extra;
+  }
+  if (removedUnknownCount > 0) {
+    const extra = `${removedUnknownCount} item tidak disertakan karena verifikasi online tidak konklusif.`;
     warning = warning ? `${warning} ${extra}` : extra;
   }
 

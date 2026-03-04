@@ -1,6 +1,10 @@
 const fs = require('fs');
 const path = require('path');
 const { doubleCheckIngredientSafetyOnline } = require('./verifyIngredientOnline');
+const {
+  isDatasetDangerousIngredient,
+  getDatasetCanonicalKey,
+} = require('./ingredientDataset');
 
 const STORE_DIR = path.join(__dirname, '..', 'data');
 const STORE_PATH = path.join(STORE_DIR, 'ingredient_decisions.json');
@@ -14,6 +18,7 @@ const CANONICAL_ALIASES = {
   alcohol: ['ethanol', 'ethyl alcohol', 'alcohol denat', 'denatured alcohol'],
   fragrance: ['parfum', 'perfume'],
   'sodium benzoate': ['natrium benzoat'],
+  phenoxyethanol: ['fenoksietanol'],
   water: ['aqua'],
 };
 
@@ -71,6 +76,8 @@ const CONTEXTUAL_CAUTION_KEYS = new Set([
   'caprylic',
   'caprylyl glycol',
   'sodium lactate',
+  'zinc oxide',
+  'titanium dioxide',
 ]);
 
 function normalizeKey(value) {
@@ -83,11 +90,33 @@ function normalizeKey(value) {
 
 function canonicalKey(value) {
   const key = normalizeKey(value);
+  const datasetCanonical = getDatasetCanonicalKey(value);
+  if (datasetCanonical) {
+    return datasetCanonical;
+  }
   return ALIAS_TO_CANONICAL[key] || key;
 }
 
+function choosePreferredLanguageName(canonical, variants = []) {
+  const cleanedVariants = variants
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+
+  if (cleanedVariants.length === 0) {
+    return '';
+  }
+
+  const canonicalHit = cleanedVariants.find((name) => normalizeKey(name) === canonical);
+  if (canonicalHit) {
+    return canonicalHit;
+  }
+
+  return cleanedVariants[0];
+}
+
 function isAlwaysUnsafeIngredient(value) {
-  return ALWAYS_UNSAFE_KEYS.has(canonicalKey(value));
+  const key = canonicalKey(value);
+  return ALWAYS_UNSAFE_KEYS.has(key) || isDatasetDangerousIngredient(value) || isDatasetDangerousIngredient(key);
 }
 
 function isContextualCautionIngredient(value) {
@@ -164,7 +193,7 @@ function buildRiskItemFromRecord(record, fallbackName) {
 function mergeWithRecord(current, record) {
   return {
     ...current,
-    name: record.name || current.name,
+    name: current.name || record.name,
     aliases:
       Array.isArray(record.aliases) && record.aliases.length > 0
         ? record.aliases
@@ -204,8 +233,8 @@ function mergeWithRecord(current, record) {
 }
 
 function dedupeSafeIngredients(names) {
-  const unique = [];
-  const seen = new Set();
+  const grouped = new Map();
+  const order = [];
 
   for (const value of names) {
     const name = String(value || '').trim();
@@ -214,15 +243,20 @@ function dedupeSafeIngredients(names) {
     }
 
     const key = canonicalKey(name);
-    if (!key || seen.has(key)) {
+    if (!key) {
       continue;
     }
 
-    seen.add(key);
-    unique.push(name);
+    if (!grouped.has(key)) {
+      grouped.set(key, []);
+      order.push(key);
+    }
+    grouped.get(key).push(name);
   }
 
-  return unique;
+  return order
+    .map((key) => choosePreferredLanguageName(key, grouped.get(key)))
+    .filter(Boolean);
 }
 
 function toDisplayName(name, fallback = '') {
@@ -423,6 +457,19 @@ async function stabilizeWithIngredientMemory(data, options = {}) {
     nameByKey.set(key, toDisplayName(name, key));
     const record = store.items[key];
     if (record && record.verdict === 'risky') {
+      if (isContextualCautionIngredient(name) && !isAlwaysUnsafeIngredient(name)) {
+        const currentSafeName = safeMap.get(key) || '';
+        const preferredSafeName = choosePreferredLanguageName(
+          key,
+          [currentSafeName, name, record?.name].filter(Boolean)
+        );
+        safeMap.set(key, preferredSafeName || record?.name || name);
+        if (forceInternetRecheck) {
+          keysToRecheck.add(key);
+        }
+        continue;
+      }
+
       riskyMap.set(key, buildRiskItemFromRecord(record, name));
       if (forceInternetRecheck) {
         keysToRecheck.add(key);
@@ -430,7 +477,12 @@ async function stabilizeWithIngredientMemory(data, options = {}) {
       continue;
     }
 
-    safeMap.set(key, record?.name || name);
+    const currentSafeName = safeMap.get(key) || '';
+    const preferredSafeName = choosePreferredLanguageName(
+      key,
+      [currentSafeName, name, record?.name].filter(Boolean)
+    );
+    safeMap.set(key, preferredSafeName || record?.name || name);
     if (record && forceInternetRecheck) {
       keysToRecheck.add(key);
     }
@@ -576,7 +628,10 @@ async function stabilizeWithIngredientMemory(data, options = {}) {
     const canDowngradeRiskyToSafe =
       prev &&
       prev.verdict === 'risky' &&
-      latestCheckStatus === 'safe' &&
+      (latestCheckStatus === 'safe' ||
+        (isContextualCautionIngredient(name) &&
+          !isAlwaysUnsafeIngredient(name) &&
+          latestCheckStatus === 'caution')) &&
       !isAlwaysUnsafeIngredient(name);
 
     if (prev && prev.verdict === 'risky' && !canDowngradeRiskyToSafe) {
