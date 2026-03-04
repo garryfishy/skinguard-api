@@ -2,6 +2,7 @@ const express = require('express');
 const {
   analyzeIngredients,
   refineDetectedIngredientsWithAI,
+  scoreRiskyIngredientsForSkincare,
   HF_MODEL_ID,
 } = require('../services/huggingface');
 const { parseAIResponse } = require('../utils/parseAIResponse');
@@ -78,7 +79,7 @@ function shouldScheduleCacheRecheck(cachedEntry) {
   return Date.now() - lastRecheckedAt >= ANALYSIS_CACHE_RECHECK_INTERVAL_MS;
 }
 
-async function refreshCachedAnalysisInBackground(cacheKey, cachedData) {
+async function refreshCachedAnalysisInBackground(cacheKey, cachedData, ingredientText = '') {
   if (!cacheKey || !cachedData || cacheRecheckInFlight.has(cacheKey)) {
     return;
   }
@@ -89,9 +90,13 @@ async function refreshCachedAnalysisInBackground(cacheKey, cachedData) {
       forceInternetRecheck: true,
     });
     if (Number(refreshed?.totalDetected || 0) > 0) {
-      const preparedRefreshed = sanitizeUserFacingData(
-        attachIngredientClassifications(refreshed)
+      const classified = attachIngredientClassifications(refreshed);
+      const withNarrative = attachNarrativeSummaries(classified);
+      const withSkincareAssessment = await applySkincareContextAIGating(
+        withNarrative,
+        ingredientText
       );
+      const preparedRefreshed = sanitizeUserFacingData(withSkincareAssessment);
       setCachedAnalysis(cacheKey, preparedRefreshed, { lastRecheckedAt: Date.now() });
       return;
     }
@@ -155,10 +160,44 @@ function sanitizeUserFacingData(data) {
     ...data,
     warning: data.warning ? sanitizeUserFacingText(data.warning) : data.warning,
     summary: data.summary ? sanitizeUserFacingText(data.summary) : data.summary,
+    riskNarrative: sanitizeUserFacingText(data.riskNarrative || ''),
+    overallRecommendation: data?.overallRecommendation
+      ? {
+          safe: Boolean(data.overallRecommendation.safe),
+          reason: sanitizeUserFacingText(data.overallRecommendation.reason || ''),
+        }
+      : data?.overallRecommendation,
+    skincareContextAssessment: data?.skincareContextAssessment
+      ? {
+          ...data.skincareContextAssessment,
+          reason: sanitizeUserFacingText(data.skincareContextAssessment.reason || ''),
+          items: Array.isArray(data.skincareContextAssessment.items)
+            ? data.skincareContextAssessment.items.map((item) => ({
+                ...item,
+                ingredient: String(item?.ingredient || '').trim(),
+                reason: sanitizeUserFacingText(item?.reason || ''),
+                score: Number(item?.score || 0),
+                confidence: Number(item?.confidence || 0),
+              }))
+            : [],
+        }
+      : data?.skincareContextAssessment,
+    pregnancy: data?.pregnancy
+      ? {
+          safe: Boolean(data.pregnancy.safe),
+          reason: sanitizeUserFacingText(data.pregnancy.reason || ''),
+          affectedIngredients: Array.isArray(data.pregnancy.affectedIngredients)
+            ? data.pregnancy.affectedIngredients.map((name) => String(name || '').trim()).filter(Boolean)
+            : [],
+        }
+      : data?.pregnancy,
     riskyIngredients: riskyIngredients.map((item) => ({
       ...item,
       risk: sanitizeUserFacingText(item?.risk || ''),
       severityReason: sanitizeUserFacingText(item?.severityReason || ''),
+      skincareRiskScore: Number(item?.skincareRiskScore || 0),
+      skincareRiskReason: sanitizeUserFacingText(item?.skincareRiskReason || ''),
+      skincareRiskConfidence: Number(item?.skincareRiskConfidence || 0),
       pregnancy: item?.pregnancy
         ? {
             ...item.pregnancy,
@@ -183,6 +222,351 @@ function sanitizeUserFacingData(data) {
       confidence: Number(item?.confidence || 0),
       family: String(item?.family || ''),
     })),
+  };
+}
+
+function joinNaturalLanguage(items = []) {
+  const values = Array.isArray(items)
+    ? items.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  if (values.length === 0) {
+    return '';
+  }
+  if (values.length === 1) {
+    return values[0];
+  }
+  if (values.length === 2) {
+    return `${values[0]} dan ${values[1]}`;
+  }
+  const head = values.slice(0, -1).join(', ');
+  return `${head}, dan ${values[values.length - 1]}`;
+}
+
+const PREGNANCY_EFFECT_RULES = [
+  {
+    pattern: /\b(mercury|merkuri|raksa)\b/i,
+    effect:
+      'Paparan merkuri dapat bersifat neurotoksik dan berisiko mengganggu perkembangan janin.',
+  },
+  {
+    pattern: /\b(lead|timbal|pb)\b/i,
+    effect:
+      'Paparan timbal dapat berdampak pada sistem saraf dan berisiko pada pertumbuhan serta perkembangan janin.',
+  },
+  {
+    pattern: /\b(arsenic|arsen)\b/i,
+    effect:
+      'Paparan arsenik berkaitan dengan toksisitas sistemik yang tidak dianjurkan selama kehamilan.',
+  },
+  {
+    pattern: /\b(cadmium|kadmium|thallium|talium)\b/i,
+    effect:
+      'Logam berat seperti kadmium atau talium berisiko menambah beban toksik pada ibu dan janin.',
+  },
+  {
+    pattern: /\b(hydroquinone|hidrokuinon)\b/i,
+    effect:
+      'Hydroquinone memiliki potensi penyerapan sistemik relatif tinggi sehingga sebaiknya dihindari saat hamil.',
+  },
+  {
+    pattern: /\b(retinoic acid|asam retinoat|tretinoin)\b/i,
+    effect:
+      'Turunan retinoid tidak disarankan pada kehamilan karena berpotensi meningkatkan risiko gangguan perkembangan janin.',
+  },
+  {
+    pattern: /\b(clobetasol|betamethasone|betametason)\b/i,
+    effect:
+      'Kortikosteroid poten berisiko menimbulkan efek sistemik bila digunakan luas atau jangka panjang selama kehamilan.',
+  },
+];
+
+function resolvePregnancyEffectByName(name) {
+  const key = normalizeIngredientKey(name);
+  if (!key) {
+    return '';
+  }
+
+  for (const rule of PREGNANCY_EFFECT_RULES) {
+    if (rule.pattern.test(key)) {
+      return rule.effect;
+    }
+  }
+
+  return '';
+}
+
+function buildRiskNarrative(data) {
+  const riskyIngredients = Array.isArray(data?.riskyIngredients) ? data.riskyIngredients : [];
+  if (riskyIngredients.length === 0) {
+    return 'Berdasarkan bahan yang terdeteksi, tidak ada indikasi utama bahan berisiko tinggi pada komposisi produk ini.';
+  }
+
+  const names = riskyIngredients
+    .map((item) => String(item?.name || '').trim())
+    .filter(Boolean)
+    .slice(0, 5);
+  const nameText = joinNaturalLanguage(names);
+
+  const reasons = riskyIngredients
+    .map((item) => String(item?.risk || item?.severityReason || '').trim())
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((text) => text.replace(/[.]+$/g, ''));
+
+  const reasonText =
+    reasons.length > 0
+      ? reasons.join('. ')
+      : 'bahan-bahan tersebut memiliki profil risiko yang perlu diwaspadai';
+
+  const hasHighDanger = riskyIngredients.some(
+    (item) =>
+      String(item?.classification || '').toUpperCase() === INGREDIENT_CLASSIFICATIONS.DANGEROUS ||
+      String(item?.severity || '').toLowerCase() === 'high'
+  );
+  const closing = hasHighDanger
+    ? 'Karena itu, produk ini termasuk kurang direkomendasikan tanpa pertimbangan medis.'
+    : 'Produk masih bisa dipertimbangkan dengan pemakaian hati-hati dan uji cocok terlebih dahulu.';
+
+  return `Adanya bahan ${nameText} membuat produk ini perlu diwaspadai karena ${reasonText}. ${closing}`;
+}
+
+function buildPregnancySummary(data) {
+  const riskyIngredients = Array.isArray(data?.riskyIngredients) ? data.riskyIngredients : [];
+  const pregnancyRiskItems = riskyIngredients.filter((item) => {
+    if (item?.pregnancy && item.pregnancy.safe === false) {
+      return true;
+    }
+
+    const classification = String(item?.classification || '').toUpperCase();
+    if (classification === INGREDIENT_CLASSIFICATIONS.DANGEROUS) {
+      return true;
+    }
+
+    return String(item?.severity || '').toLowerCase() === 'high';
+  });
+
+  if (pregnancyRiskItems.length === 0) {
+    return {
+      safe: true,
+      reason:
+        'Berdasarkan komposisi yang terdeteksi, tidak ditemukan sinyal utama bahan berisiko tinggi untuk kehamilan. Tetap gunakan sesuai aturan dan hentikan pemakaian bila muncul iritasi.',
+      affectedIngredients: [],
+    };
+  }
+
+  const affectedIngredients = pregnancyRiskItems
+    .map((item) => String(item?.name || '').trim())
+    .filter(Boolean)
+    .slice(0, 5);
+  const affectedText = joinNaturalLanguage(affectedIngredients);
+
+  const effects = pregnancyRiskItems
+    .map((item) => resolvePregnancyEffectByName(item?.name))
+    .filter(Boolean);
+  const uniqueEffects = Array.from(new Set(effects)).slice(0, 2);
+
+  const fallbackEffect =
+    'Bahan-bahan tersebut dapat meningkatkan risiko iritasi berat, paparan toksik sistemik, atau efek yang tidak diinginkan pada ibu hamil.';
+  const effectParagraph = uniqueEffects.length > 0 ? uniqueEffects.join(' ') : fallbackEffect;
+
+  return {
+    safe: false,
+    reason: `Produk ini tidak disarankan untuk ibu hamil karena mengandung ${affectedText}. ${effectParagraph} Sebaiknya pilih alternatif yang lebih aman dan konsultasikan ke tenaga medis sebelum pemakaian.`,
+    affectedIngredients,
+  };
+}
+
+function attachNarrativeSummaries(data) {
+  if (!data || typeof data !== 'object') {
+    return data;
+  }
+
+  return {
+    ...data,
+    riskNarrative: buildRiskNarrative(data),
+    pregnancy: buildPregnancySummary(data),
+  };
+}
+
+function buildSkincareAssessmentReason({
+  isSafe,
+  averageScore,
+  maxScore,
+  maxIngredientName,
+  strictDangerNames,
+  avgThreshold,
+  highThreshold,
+}) {
+  const roundedAvg = Number(averageScore.toFixed(2));
+  const roundedMax = Number(maxScore.toFixed(2));
+
+  if (Array.isArray(strictDangerNames) && strictDangerNames.length > 0) {
+    const strictNames = joinNaturalLanguage(strictDangerNames.slice(0, 3));
+    return `Produk tidak disarankan karena terdapat bahan berisiko tinggi (${strictNames}) yang secara umum masuk kategori berbahaya dalam konteks skincare.`;
+  }
+
+  if (!isSafe && roundedMax >= highThreshold) {
+    return `Produk tidak disarankan karena ada bahan dengan skor risiko tinggi (${roundedMax}/10) pada konteks skincare, khususnya ${maxIngredientName}.`;
+  }
+
+  if (!isSafe && roundedAvg >= avgThreshold) {
+    return `Produk tidak disarankan karena rata-rata skor risiko bahan bermasalah mencapai ${roundedAvg}/10 dalam konteks skincare.`;
+  }
+
+  return `Walaupun ada bahan yang perlu diperhatikan, rata-rata skor risiko dalam konteks skincare adalah ${roundedAvg}/10 (maksimum ${roundedMax}/10), sehingga produk masih tergolong aman dipakai sesuai aturan pakai.`;
+}
+
+async function applySkincareContextAIGating(data, ingredientText = '') {
+  if (!data || typeof data !== 'object') {
+    return data;
+  }
+
+  const riskyIngredients = Array.isArray(data.riskyIngredients) ? data.riskyIngredients : [];
+  if (riskyIngredients.length === 0) {
+    return {
+      ...data,
+      skincareContextAssessment: {
+        enabled: true,
+        scoredCount: 0,
+        averageScore: 0,
+        maxScore: 0,
+        thresholdAverage: 6,
+        thresholdHighItem: 8,
+        isSafe: true,
+        reason:
+          'Tidak ada bahan berisiko yang perlu dinilai ulang, sehingga produk dinilai aman pada konteks skincare.',
+        items: [],
+        checkedAt: new Date().toISOString(),
+      },
+      overallRecommendation: {
+        safe: true,
+        reason:
+          'Tidak ada bahan berisiko tinggi yang terdeteksi, sehingga produk dinilai aman dipakai sesuai aturan pakai.',
+      },
+    };
+  }
+
+  const hasReusableAssessment =
+    data?.skincareContextAssessment &&
+    Array.isArray(data.skincareContextAssessment.items) &&
+    Number(data.skincareContextAssessment.items.length || 0) >= riskyIngredients.length;
+  if (hasReusableAssessment) {
+    return data;
+  }
+
+  let scoredItems = [];
+  try {
+    scoredItems = await scoreRiskyIngredientsForSkincare(riskyIngredients, { ingredientText });
+  } catch (error) {
+    scoredItems = [];
+  }
+
+  if (!Array.isArray(scoredItems) || scoredItems.length === 0) {
+    return data;
+  }
+
+  const scoreByKey = new Map();
+  for (const item of scoredItems) {
+    const key = normalizeRefinementKey(item?.ingredient || item?.name);
+    if (!key) {
+      continue;
+    }
+    scoreByKey.set(key, item);
+  }
+
+  const riskyWithScores = riskyIngredients.map((item) => {
+    const key = normalizeRefinementKey(item?.name);
+    const scored = scoreByKey.get(key);
+    if (!scored) {
+      return item;
+    }
+
+    return {
+      ...item,
+      skincareRiskScore: Number(scored.score || 0),
+      skincareRiskReason: String(scored.reason || '').trim(),
+      skincareRiskConfidence: Number(scored.confidence || 0),
+    };
+  });
+
+  const validScores = scoredItems
+    .map((item) => Number(item?.score))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  if (validScores.length === 0) {
+    return {
+      ...data,
+      riskyIngredients: riskyWithScores,
+    };
+  }
+
+  const avgThreshold = Number(process.env.SKINCARE_AI_SCORE_AVG_THRESHOLD || 6);
+  const highThreshold = Number(process.env.SKINCARE_AI_SCORE_HIGH_THRESHOLD || 8);
+  const sum = validScores.reduce((acc, value) => acc + value, 0);
+  const averageScore = sum / validScores.length;
+
+  let maxScore = 0;
+  let maxIngredientName = '';
+  for (const item of scoredItems) {
+    const score = Number(item?.score || 0);
+    if (score > maxScore) {
+      maxScore = score;
+      maxIngredientName = String(item?.ingredient || '').trim();
+    }
+  }
+
+  const strictDangerNames = riskyWithScores
+    .filter(
+      (item) =>
+        String(item?.classification || '').toUpperCase() === INGREDIENT_CLASSIFICATIONS.DANGEROUS
+    )
+    .map((item) => String(item?.name || '').trim())
+    .filter(Boolean);
+
+  const hasHighItem = maxScore >= highThreshold;
+  const hasHighAverage = averageScore >= avgThreshold;
+  const hasStrictDanger = strictDangerNames.length > 0;
+  const isSafe = !hasStrictDanger && !hasHighItem && !hasHighAverage;
+  const reason = buildSkincareAssessmentReason({
+    isSafe,
+    averageScore,
+    maxScore,
+    maxIngredientName,
+    strictDangerNames,
+    avgThreshold,
+    highThreshold,
+  });
+
+  const existingNarrative = String(data.riskNarrative || '').trim();
+  const narrativePrefix = reason.replace(/[.]+$/g, '');
+  const riskNarrative = existingNarrative
+    ? `${narrativePrefix}. ${existingNarrative}`.trim()
+    : reason;
+
+  return {
+    ...data,
+    riskyIngredients: riskyWithScores,
+    riskNarrative,
+    skincareContextAssessment: {
+      enabled: true,
+      scoredCount: validScores.length,
+      averageScore: Number(averageScore.toFixed(2)),
+      maxScore: Number(maxScore.toFixed(2)),
+      thresholdAverage: avgThreshold,
+      thresholdHighItem: highThreshold,
+      isSafe,
+      reason,
+      items: scoredItems.map((item) => ({
+        ingredient: String(item?.ingredient || '').trim(),
+        score: Number(item?.score || 0),
+        reason: String(item?.reason || '').trim(),
+        confidence: Number(item?.confidence || 0),
+      })),
+      checkedAt: new Date().toISOString(),
+    },
+    overallRecommendation: {
+      safe: isSafe,
+      reason,
+    },
   };
 }
 
@@ -659,11 +1043,9 @@ router.post('/', async (req, res) => {
     if (cachedEntry && cachedEntry.data) {
       const shouldRecheck = shouldScheduleCacheRecheck(cachedEntry);
       if (shouldRecheck) {
-        void refreshCachedAnalysisInBackground(cacheKey, cachedEntry.data);
+        void refreshCachedAnalysisInBackground(cacheKey, cachedEntry.data, sanitizedText);
       }
-      const cachedResponseData = sanitizeUserFacingData(
-        attachIngredientClassifications(cachedEntry.data)
-      );
+      const cachedResponseData = sanitizeUserFacingData(cachedEntry.data);
       return res.status(200).json({
         success: true,
         data: cachedResponseData,
@@ -687,9 +1069,10 @@ router.post('/', async (req, res) => {
     const stabilized = await stabilizeWithIngredientMemory(verified, {
       forceInternetRecheck: true,
     });
-    const finalizedData = sanitizeUserFacingData(
-      attachIngredientClassifications(stabilized)
-    );
+    const classified = attachIngredientClassifications(stabilized);
+    const withNarrative = attachNarrativeSummaries(classified);
+    const withSkincareAssessment = await applySkincareContextAIGating(withNarrative, sanitizedText);
+    const finalizedData = sanitizeUserFacingData(withSkincareAssessment);
     learnRejectedCandidates(candidates, stabilized);
     if (Number(finalizedData?.totalDetected || 0) > 0) {
       setCachedAnalysis(cacheKey, finalizedData, { lastRecheckedAt: Date.now() });

@@ -1,4 +1,6 @@
 const {
+  INGREDIENT_CLASSIFICATIONS,
+  classifyIngredientName,
   isDatasetDangerousIngredient,
   getDatasetCanonicalKey,
 } = require('./ingredientDataset');
@@ -100,6 +102,10 @@ const MINERAL_FILTER_CONTEXTUAL_KEYS = new Set([
   'titanium dioxide',
 ]);
 
+function isContextualCautionKey(nameOrKey) {
+  return !isHardDangerousKey(nameOrKey);
+}
+
 function isKnownRiskKey(key) {
   return isHardDangerousKey(key) || CONDITIONAL_CAUTION_KEYS.has(key);
 }
@@ -136,7 +142,12 @@ function isHardDangerousKey(nameOrKey) {
     return true;
   }
 
-  return isDatasetDangerousIngredient(nameOrKey) || isDatasetDangerousIngredient(key);
+  if (isDatasetDangerousIngredient(nameOrKey) || isDatasetDangerousIngredient(key)) {
+    return true;
+  }
+
+  const classified = classifyIngredientName(nameOrKey);
+  return String(classified?.classification || '').toUpperCase() === INGREDIENT_CLASSIFICATIONS.DANGEROUS;
 }
 
 function choosePreferredLanguageName(canonical, variants = []) {
@@ -605,7 +616,7 @@ function hasHighConcentrationHint(item, ingredientIndex, key = '') {
 function computeRecommendation(item, ingredientIndex) {
   const key = canonicalKey(item.name);
   const definitelyDangerous = isHardDangerousKey(key);
-  const conditional = CONDITIONAL_CAUTION_KEYS.has(key);
+  const conditional = isContextualCautionKey(key);
   const highConcentrationLikely = hasHighConcentrationHint(item, ingredientIndex, key);
 
   if (definitelyDangerous) {
@@ -617,26 +628,19 @@ function computeRecommendation(item, ingredientIndex) {
   }
 
   if (conditional) {
-    if (item.severity === 'high' && highConcentrationLikely) {
-      return {
-        safe: false,
-        reason:
-          'Tidak direkomendasikan untuk dibeli karena bahan ini bersifat kontekstual namun terindikasi berisiko tinggi pada kadar/paparan yang kemungkinan tinggi.',
-      };
-    }
-
     return {
       safe: true,
-      reason:
-        'Masih bisa dipertimbangkan untuk dibeli, namun gunakan dengan hati-hati karena risiko bahan ini bergantung pada kadar, frekuensi pemakaian, dan sensitivitas kulit.',
+      reason: highConcentrationLikely
+        ? 'Masih bisa dipertimbangkan untuk dibeli, namun gunakan lebih hati-hati karena bahan ini terdeteksi di urutan awal komposisi dan risikonya bergantung pada kadar serta sensitivitas kulit.'
+        : 'Masih bisa dipertimbangkan untuk dibeli, namun gunakan dengan hati-hati karena risiko bahan ini bergantung pada kadar, frekuensi pemakaian, dan sensitivitas kulit.',
     };
   }
 
   if (item.severity === 'high') {
     return {
-      safe: false,
+      safe: true,
       reason:
-        'Tidak direkomendasikan untuk dibeli karena tingkat risikonya tinggi berdasarkan profil toksisitas dan potensi dampak kesehatan.',
+        'Masih bisa dipertimbangkan dengan kehati-hatian tinggi karena ada indikasi risiko pada kondisi tertentu; perhatikan reaksi kulit dan batasi frekuensi pemakaian.',
     };
   }
 
@@ -676,19 +680,21 @@ function applyDeterministicRiskProfile(item, ingredientIndex) {
     return profiled;
   }
 
-  if (CONDITIONAL_CAUTION_KEYS.has(key)) {
-    profiled.severity = highConcentrationLikely ? 'high' : 'medium';
+  if (isContextualCautionKey(key)) {
+    if (profiled.severity === 'high' || !profiled.severity) {
+      profiled.severity = 'medium';
+    }
     if (isGenericRiskText(profiled.risk)) {
       profiled.risk =
         'Bahan ini bersifat kontekstual: biasanya dipakai sebagai komponen formulasi, tetapi bisa memicu masalah pada kadar tinggi atau kulit sensitif.';
     }
     profiled.severityReason = highConcentrationLikely
-      ? 'Risiko tinggi karena bahan ini terindikasi berada pada porsi awal komposisi atau memiliki petunjuk kadar tinggi.'
+      ? 'Perlu kehati-hatian tambahan karena bahan ini terindikasi berada pada porsi awal komposisi sehingga paparannya bisa lebih tinggi.'
       : 'Risiko sedang karena dampaknya sangat bergantung pada kadar, frekuensi pemakaian, dan sensitivitas pengguna.';
     profiled.pregnancy = {
-      safe: false,
+      safe: true,
       reason:
-        'Perlu kehati-hatian saat hamil; keamanan sangat bergantung pada kadar dan kondisi individu, konsultasi medis disarankan.',
+        'Secara umum dapat dipertimbangkan saat hamil pada kadar kosmetik normal, namun tetap disarankan berhati-hati dan konsultasi jika memiliki kondisi khusus.',
     };
     return profiled;
   }

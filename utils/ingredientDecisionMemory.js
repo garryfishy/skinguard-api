@@ -2,6 +2,8 @@ const fs = require('fs');
 const path = require('path');
 const { doubleCheckIngredientSafetyOnline } = require('./verifyIngredientOnline');
 const {
+  INGREDIENT_CLASSIFICATIONS,
+  classifyIngredientName,
   isDatasetDangerousIngredient,
   getDatasetCanonicalKey,
 } = require('./ingredientDataset');
@@ -60,26 +62,6 @@ const ALWAYS_UNSAFE_KEYS = new Set([
   'clobetasol',
 ]);
 
-const CONTEXTUAL_CAUTION_KEYS = new Set([
-  'alcohol',
-  'sodium benzoate',
-  'fragrance',
-  'phenoxyethanol',
-  'salicylic acid',
-  'benzyl alcohol',
-  'benzoic acid',
-  'potassium sorbate',
-  'sorbic acid',
-  'paraben',
-  'propylene glycol',
-  'butylene glycol',
-  'caprylic',
-  'caprylyl glycol',
-  'sodium lactate',
-  'zinc oxide',
-  'titanium dioxide',
-]);
-
 function normalizeKey(value) {
   return String(value || '')
     .toLowerCase()
@@ -116,11 +98,16 @@ function choosePreferredLanguageName(canonical, variants = []) {
 
 function isAlwaysUnsafeIngredient(value) {
   const key = canonicalKey(value);
-  return ALWAYS_UNSAFE_KEYS.has(key) || isDatasetDangerousIngredient(value) || isDatasetDangerousIngredient(key);
+  if (ALWAYS_UNSAFE_KEYS.has(key) || isDatasetDangerousIngredient(value) || isDatasetDangerousIngredient(key)) {
+    return true;
+  }
+
+  const classified = classifyIngredientName(value);
+  return String(classified?.classification || '').toUpperCase() === INGREDIENT_CLASSIFICATIONS.DANGEROUS;
 }
 
 function isContextualCautionIngredient(value) {
-  return CONTEXTUAL_CAUTION_KEYS.has(canonicalKey(value));
+  return !isAlwaysUnsafeIngredient(value);
 }
 
 function ensureStoreLoaded() {
@@ -278,11 +265,8 @@ function isHardUnsafeByCheck(name, check) {
     return false;
   }
 
-  if (isContextualCautionIngredient(name)) {
-    return false;
-  }
-
-  return true;
+  const classified = classifyIngredientName(name);
+  return String(classified?.classification || '').toUpperCase() === INGREDIENT_CLASSIFICATIONS.DANGEROUS;
 }
 
 function buildRiskItemFromOnlineCheck(name, check) {
@@ -300,10 +284,10 @@ function buildRiskItemFromOnlineCheck(name, check) {
       ? 'Terdapat kode bahaya GHS berdampak tinggi pada referensi tambahan.'
       : 'Terdapat indikator kehati-hatian pada referensi tambahan sehingga risikonya kontekstual (bergantung kadar/formulasi).',
     pregnancy: {
-      safe: false,
+      safe: !hardUnsafe,
       reason: hardUnsafe
         ? 'Tidak disarankan saat hamil karena ada indikasi toksisitas tinggi.'
-        : 'Perlu kehati-hatian saat hamil; konsultasikan penggunaan terutama bila kulit sensitif atau ada riwayat iritasi.',
+        : 'Umumnya masih dapat dipertimbangkan saat hamil pada kadar kosmetik normal, namun tetap gunakan bertahap dan hentikan bila muncul iritasi.',
     },
     recommendation: {
       safe: !hardUnsafe,
@@ -337,10 +321,10 @@ function strengthenRiskItemWithOnlineCheck(item, check) {
     severityReason,
     risk: String(check?.reason || item.risk || 'No description available'),
     pregnancy: {
-      safe: false,
+      safe: !hardUnsafe,
       reason: hardUnsafe
         ? 'Tidak aman untuk kehamilan karena indikator bahaya tinggi.'
-        : 'Perlu kehati-hatian saat hamil; gunakan seperlunya dan konsultasikan bila perlu.',
+        : 'Umumnya masih dapat dipertimbangkan saat hamil pada kadar kosmetik normal, namun tetap gunakan seperlunya dan konsultasikan bila perlu.',
     },
     recommendation: {
       safe: recommendationSafe,

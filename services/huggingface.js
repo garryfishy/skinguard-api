@@ -1,6 +1,8 @@
 const HF_API_TOKEN = process.env.HF_API_TOKEN;
 const HF_MODEL_ID = process.env.HF_MODEL_ID || "Qwen/Qwen2.5-7B-Instruct";
 const HF_CHAT_ENDPOINT = "https://router.huggingface.co/v1/chat/completions";
+const SKINCARE_RISK_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+const skincareRiskCache = new Map();
 
 function buildPrompt(ingredientText) {
   return [
@@ -39,6 +41,27 @@ function normalizeTokenKey(value) {
     .replace(/[^a-z0-9\s]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function getCachedSkincareRisk(key) {
+  const cached = skincareRiskCache.get(key);
+  if (!cached) {
+    return null;
+  }
+
+  if (Date.now() - cached.ts > SKINCARE_RISK_CACHE_TTL_MS) {
+    skincareRiskCache.delete(key);
+    return null;
+  }
+
+  return cached.value;
+}
+
+function setCachedSkincareRisk(key, value) {
+  skincareRiskCache.set(key, {
+    value,
+    ts: Date.now(),
+  });
 }
 
 function extractJsonArrayChunk(rawText) {
@@ -88,6 +111,65 @@ function extractQuotedStringArrays(rawText) {
   }
 
   return arrays;
+}
+
+function parseJsonObjectFromContent(content) {
+  const text = String(content || "").trim();
+  if (!text) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed;
+    }
+  } catch (error) {
+    // fallback below
+  }
+
+  const fenced = extractFencedJsonChunk(text);
+  if (fenced) {
+    try {
+      const parsed = JSON.parse(fenced);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed;
+      }
+    } catch (error) {
+      // fallback below
+    }
+  }
+
+  const objectChunk = extractJsonObjectChunk(text);
+  if (objectChunk) {
+    try {
+      const parsed = JSON.parse(objectChunk);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed;
+      }
+    } catch (error) {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+function clampScoreToRange(value, min = 1, max = 10) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) {
+    return min;
+  }
+
+  if (num < min) {
+    return min;
+  }
+
+  if (num > max) {
+    return max;
+  }
+
+  return Number(num.toFixed(2));
 }
 
 function parseTokenListFromModelContent(content, candidateKeyMap) {
@@ -449,8 +531,143 @@ async function analyzeIngredients(text) {
   }
 }
 
+async function scoreSingleIngredientRiskForSkincare(
+  ingredientName,
+  { ingredientText = "" } = {}
+) {
+  const name = String(ingredientName || "").trim();
+  if (!name || !HF_API_TOKEN) {
+    return null;
+  }
+
+  const cacheKey = normalizeTokenKey(name);
+  const cached = getCachedSkincareRisk(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  const prompt = [
+    "Kamu adalah analis keamanan bahan kosmetik.",
+    "Tugas: beri skor risiko bahan dalam konteks produk skincare/cosmetic jadi (bukan konteks industri bahan mentah murni).",
+    "Gunakan asumsi kadar kosmetik umum yang legal, kecuali bahan jelas berbahaya/terlarang.",
+    "Balas HANYA JSON object valid dengan format:",
+    '{"ingredient":"string","score":1-10,"reason":"string","confidence":0-1}',
+    "Aturan skor:",
+    "- 1 = sangat aman pada pemakaian kosmetik normal",
+    "- 5 = perlu kehati-hatian sedang",
+    "- 10 = sangat berbahaya/umumnya tidak disarankan",
+    "- Jika bahan umumnya aman di kadar kosmetik, skor cenderung rendah (mis. 2-5).",
+    "- score harus angka 1-10, confidence 0-1.",
+    "- reason maksimal 1-2 kalimat Bahasa Indonesia, fokus konteks skincare.",
+    "",
+    `Ingredient: ${name}`,
+    ingredientText ? `Ingredient text source: ${ingredientText}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 20000);
+
+  try {
+    const response = await fetch(HF_CHAT_ENDPOINT, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${HF_API_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: HF_MODEL_ID,
+        messages: [
+          {
+            role: "system",
+            content:
+              'Kamu menilai skor risiko bahan skincare. Beri output JSON object saja: {"ingredient":"string","score":1-10,"reason":"string","confidence":0-1}. Fokus konteks kosmetik jadi, bukan bahaya bahan mentah industri.',
+          },
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+        temperature: 0,
+        top_p: 1,
+        max_tokens: 220,
+        stream: false,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const payload = await response.json();
+    const content = payload?.choices?.[0]?.message?.content;
+    if (typeof content !== "string") {
+      return null;
+    }
+
+    const parsed = parseJsonObjectFromContent(content);
+    if (!parsed) {
+      return null;
+    }
+
+    const result = {
+      ingredient: String(parsed.ingredient || name).trim() || name,
+      score: clampScoreToRange(parsed.score, 1, 10),
+      reason: String(parsed.reason || "").trim(),
+      confidence: clampScoreToRange(parsed.confidence, 0, 1),
+      source: "ai",
+    };
+
+    if (!result.reason) {
+      result.reason =
+        "Risiko dinilai berdasarkan konteks skincare; gunakan sesuai aturan pakai dan pantau reaksi kulit.";
+    }
+
+    setCachedSkincareRisk(cacheKey, result);
+    return result;
+  } catch (error) {
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function scoreRiskyIngredientsForSkincare(
+  riskyIngredients = [],
+  { ingredientText = "" } = {}
+) {
+  const maxItems = Math.max(
+    1,
+    Math.min(20, Number(process.env.SKINCARE_AI_SCORE_MAX_ITEMS || 10))
+  );
+  const uniqueNames = Array.from(
+    new Set(
+      (Array.isArray(riskyIngredients) ? riskyIngredients : [])
+        .map((item) => String(item?.name || item || "").trim())
+        .filter(Boolean)
+    )
+  ).slice(0, maxItems);
+
+  if (uniqueNames.length === 0) {
+    return [];
+  }
+
+  const output = [];
+  for (const name of uniqueNames) {
+    const scored = await scoreSingleIngredientRiskForSkincare(name, { ingredientText });
+    if (scored) {
+      output.push(scored);
+    }
+  }
+
+  return output;
+}
+
 module.exports = {
   analyzeIngredients,
   refineDetectedIngredientsWithAI,
+  scoreRiskyIngredientsForSkincare,
   HF_MODEL_ID,
 };
