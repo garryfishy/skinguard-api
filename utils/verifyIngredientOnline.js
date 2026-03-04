@@ -2,7 +2,7 @@ const PUBCHEM_BASE_URL = 'https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/nam
 const PUBCHEM_GHS_BASE_URL = 'https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound';
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const LOOKUP_TIMEOUT_MS = 2500;
-const MAX_ONLINE_LOOKUPS = 24;
+const MAX_ONLINE_LOOKUPS = 120;
 const LOOKUP_CONCURRENCY = 6;
 const DEFAULT_SAFETY_RECHECK_BUDGET = 4;
 
@@ -61,6 +61,10 @@ const KNOWN_INGREDIENT_KEYS = new Set([
   'aqua',
   'glycerin',
   'niacinamide',
+  'dimethicone',
+  'hyaluronic acid',
+  'aloe vera extract',
+  'aloe barbadensis leaf extract',
   'fragrance',
   'parfum',
   'perfume',
@@ -160,6 +164,25 @@ function isLikelyIngredient(value) {
   }
 
   return /[a-z]/i.test(text);
+}
+
+function isWeakUntrustedToken(value) {
+  const text = canonicalizeText(value);
+  if (!text) {
+    return true;
+  }
+
+  const parts = text.split(/\s+/).filter(Boolean);
+  if (parts.length !== 1) {
+    return false;
+  }
+
+  const token = parts[0].toLowerCase();
+  if (!/^[a-z]+$/.test(token)) {
+    return false;
+  }
+
+  return token.length <= 6;
 }
 
 function buildCandidateList(name, aliases = []) {
@@ -477,6 +500,10 @@ async function verifyIngredientCandidates(candidates, budget) {
     }
   }
 
+  if (isWeakUntrustedToken(candidates[0])) {
+    return false;
+  }
+
   let hasUnknown = false;
   for (const candidate of candidates) {
     if (budget.remaining <= 0) {
@@ -552,6 +579,7 @@ async function verifyParsedIngredientsOnline(parsedData) {
     return parsedData;
   }
 
+  const trustSafeFromAI = Boolean(parsedData.aiDetectedValidated);
   const budget = { remaining: MAX_ONLINE_LOOKUPS };
   let removedCount = 0;
 
@@ -576,11 +604,22 @@ async function verifyParsedIngredientsOnline(parsedData) {
   const verifiedRisky = riskyChecks.filter(Boolean);
   const riskyKeys = new Set(verifiedRisky.map((item) => normalizeKey(item.name)));
 
-  // Keep parsed safe ingredients (already filtered by parser),
-  // only remove obvious duplicates against risky ingredients.
-  const verifiedSafe = dedupeStrings(safeInput).filter(
-    (name) => !riskyKeys.has(normalizeKey(name))
-  );
+  const verifiedSafe = trustSafeFromAI
+    ? dedupeStrings(safeInput).filter((name) => !riskyKeys.has(normalizeKey(name)))
+    : dedupeStrings(
+        (
+          await mapWithConcurrency(safeInput, LOOKUP_CONCURRENCY, async (name) => {
+            const candidates = buildCandidateList(name, []);
+            const valid = await verifyIngredientCandidates(candidates, budget);
+            if (!valid) {
+              removedCount += 1;
+              return null;
+            }
+
+            return canonicalizeText(name);
+          })
+        ).filter(Boolean)
+      ).filter((name) => !riskyKeys.has(normalizeKey(name)));
   const totalDetected = verifiedRisky.length + verifiedSafe.length;
   const safeCount = verifiedSafe.length;
   const summary = recomputeSummary(verifiedRisky.length, totalDetected);
@@ -599,6 +638,8 @@ async function verifyParsedIngredientsOnline(parsedData) {
     totalDetected,
     summary,
   };
+
+  delete result.aiDetectedValidated;
 
   if (warning) {
     result.warning = warning;

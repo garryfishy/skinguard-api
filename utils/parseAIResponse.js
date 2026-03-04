@@ -230,6 +230,41 @@ function extractDetectedIngredients(ingredientText) {
   return unique;
 }
 
+function sanitizeDetectedIngredientsFromAI(rawDetectedIngredients, ingredientSection = '') {
+  if (!Array.isArray(rawDetectedIngredients)) {
+    return [];
+  }
+
+  const section = String(ingredientSection || '');
+  const normalizedSource = normalizeKey(section);
+  const unique = [];
+  const seen = new Set();
+
+  for (const raw of rawDetectedIngredients) {
+    const cleaned = stripTrailingMetadata(String(raw || '').trim()).replace(/\s+/g, ' ').trim();
+    if (!isLikelyIngredient(cleaned)) {
+      continue;
+    }
+
+    const key = canonicalKey(cleaned);
+    if (!key || seen.has(key)) {
+      continue;
+    }
+
+    if (normalizedSource) {
+      const regex = new RegExp(`\\b${escapeRegex(key)}\\b`, 'i');
+      if (!regex.test(normalizedSource)) {
+        continue;
+      }
+    }
+
+    seen.add(key);
+    unique.push(cleaned);
+  }
+
+  return unique;
+}
+
 function escapeRegex(value) {
   return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -665,15 +700,15 @@ function mergeRiskyIngredients(items) {
 }
 
 function parseAIResponse(rawText, ingredientText = '') {
-  const detectedIngredients = extractDetectedIngredients(ingredientText);
+  const detectedFromText = extractDetectedIngredients(ingredientText);
   const fallback = {
     riskyIngredients: [],
-    safeIngredients: detectedIngredients,
-    safeCount: detectedIngredients.length,
-    totalDetected: detectedIngredients.length,
+    safeIngredients: detectedFromText,
+    safeCount: detectedFromText.length,
+    totalDetected: detectedFromText.length,
     summary:
-      detectedIngredients.length > 0
-        ? `0 of ${detectedIngredients.length} detected ingredients are flagged as risky.`
+      detectedFromText.length > 0
+        ? `0 of ${detectedFromText.length} detected ingredients are flagged as risky.`
         : 'Could not reliably extract ingredients.',
     warning: 'AI response was ambiguous. Results may be incomplete.',
   };
@@ -692,12 +727,17 @@ function parseAIResponse(rawText, ingredientText = '') {
 
   const ingredientSection = extractIngredientSection(ingredientText);
   let rawIngredients = [];
+  let rawDetectedIngredients = [];
   let aiTotalDetected = 0;
 
   if (Array.isArray(parsed)) {
     rawIngredients = parsed;
     aiTotalDetected = parsed.length;
   } else if (parsed && typeof parsed === 'object') {
+    if (Array.isArray(parsed.detectedIngredients)) {
+      rawDetectedIngredients = parsed.detectedIngredients;
+    }
+
     if (Array.isArray(parsed.riskyIngredients)) {
       rawIngredients = parsed.riskyIngredients;
     }
@@ -706,6 +746,9 @@ function parseAIResponse(rawText, ingredientText = '') {
       aiTotalDetected = Math.max(0, Math.floor(parsed.totalDetected));
     }
   }
+
+  const detectedFromAI = sanitizeDetectedIngredientsFromAI(rawDetectedIngredients, ingredientSection);
+  const detectedIngredients = detectedFromAI.length > 0 ? detectedFromAI : detectedFromText;
 
   const normalizedRisky = rawIngredients.map(normalizeIngredient).filter(Boolean);
   const riskyIngredientsMerged = mergeRiskyIngredients(normalizedRisky);

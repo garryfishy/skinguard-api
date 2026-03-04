@@ -1,5 +1,9 @@
 const express = require('express');
-const { analyzeIngredients, HF_MODEL_ID } = require('../services/huggingface');
+const {
+  analyzeIngredients,
+  refineDetectedIngredientsWithAI,
+  HF_MODEL_ID,
+} = require('../services/huggingface');
 const { parseAIResponse } = require('../utils/parseAIResponse');
 const { verifyParsedIngredientsOnline } = require('../utils/verifyIngredientOnline');
 const { stabilizeWithIngredientMemory } = require('../utils/ingredientDecisionMemory');
@@ -39,6 +43,154 @@ function setCachedAnalysis(key, data) {
   }
 
   analysisCache.set(key, { data, ts: Date.now() });
+}
+
+function normalizeIngredientKey(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isLikelyIngredientName(name) {
+  const text = String(name || '').trim();
+  if (!text) {
+    return false;
+  }
+
+  const words = text.split(/\s+/).filter(Boolean);
+  if (words.length >= 2) {
+    return true;
+  }
+
+  if (/[a-z]/i.test(text) && /\d/.test(text)) {
+    return true;
+  }
+
+  return /(acid|ate|ite|ide|ine|ene|one|ol|ose|ium|yl|oxy|glycol|extract|oil|wax|oxide|chloride|sulfate|phosphate|amide|amine|ester|cone)$/i.test(
+    text
+  );
+}
+
+function refineParsedByAIDetected(parsedData, refinedDetected) {
+  if (!parsedData || typeof parsedData !== 'object') {
+    return parsedData;
+  }
+
+  if (!Array.isArray(refinedDetected) || refinedDetected.length === 0) {
+    return parsedData;
+  }
+
+  const refined = [];
+  const refinedKeySet = new Set();
+  for (const item of refinedDetected) {
+    const value = String(item || '').trim();
+    const key = normalizeIngredientKey(value);
+    if (!value || !key || refinedKeySet.has(key)) {
+      continue;
+    }
+
+    refined.push(value);
+    refinedKeySet.add(key);
+  }
+
+  if (refined.length === 0) {
+    return parsedData;
+  }
+
+  const originalDetected = [];
+  const originalSeen = new Set();
+  for (const item of Array.isArray(parsedData.safeIngredients) ? parsedData.safeIngredients : []) {
+    const value = String(item || '').trim();
+    const key = normalizeIngredientKey(value);
+    if (!value || !key || originalSeen.has(key)) {
+      continue;
+    }
+    originalSeen.add(key);
+    originalDetected.push(value);
+  }
+  for (const item of Array.isArray(parsedData.riskyIngredients) ? parsedData.riskyIngredients : []) {
+    const value = String(item?.name || '').trim();
+    const key = normalizeIngredientKey(value);
+    if (!value || !key || originalSeen.has(key)) {
+      continue;
+    }
+    originalSeen.add(key);
+    originalDetected.push(value);
+  }
+
+  const mergedDetected = [];
+  const mergedSeen = new Set();
+  for (const value of originalDetected) {
+    const key = normalizeIngredientKey(value);
+    const keep = refinedKeySet.has(key) || isLikelyIngredientName(value);
+    if (!keep || mergedSeen.has(key)) {
+      continue;
+    }
+    mergedSeen.add(key);
+    mergedDetected.push(value);
+  }
+  for (const value of refined) {
+    const key = normalizeIngredientKey(value);
+    if (!key || mergedSeen.has(key)) {
+      continue;
+    }
+    mergedSeen.add(key);
+    mergedDetected.push(value);
+  }
+
+  const detectedForOutput = mergedDetected.length > 0 ? mergedDetected : refined;
+  const detectedKeySet = new Set(detectedForOutput.map((name) => normalizeIngredientKey(name)));
+
+  const riskyInput = Array.isArray(parsedData.riskyIngredients) ? parsedData.riskyIngredients : [];
+  const riskyIngredients = riskyInput.filter((item) => {
+    const key = normalizeIngredientKey(item?.name);
+    if (key && detectedKeySet.has(key)) {
+      return true;
+    }
+
+    const aliases = Array.isArray(item?.aliases) ? item.aliases : [];
+    for (const alias of aliases) {
+      if (detectedKeySet.has(normalizeIngredientKey(alias))) {
+        return true;
+      }
+    }
+
+    return false;
+  });
+
+  const riskyKeys = new Set();
+  for (const risky of riskyIngredients) {
+    riskyKeys.add(normalizeIngredientKey(risky?.name));
+    const aliases = Array.isArray(risky?.aliases) ? risky.aliases : [];
+    for (const alias of aliases) {
+      riskyKeys.add(normalizeIngredientKey(alias));
+    }
+  }
+
+  const safeIngredients = detectedForOutput.filter(
+    (name) => !riskyKeys.has(normalizeIngredientKey(name))
+  );
+  const totalDetected = riskyIngredients.length + safeIngredients.length;
+  const safeCount = safeIngredients.length;
+  const summary = `${riskyIngredients.length} of ${totalDetected} detected ingredients are flagged as risky.`;
+
+  const warning = parsedData.warning
+    ? String(parsedData.warning)
+    : '';
+  const refinedWarning = 'Ingredient list was refined by AI token validation.';
+
+  return {
+    ...parsedData,
+    riskyIngredients,
+    safeIngredients,
+    safeCount,
+    totalDetected,
+    summary,
+    aiDetectedValidated: true,
+    warning: warning.includes(refinedWarning) ? warning : `${warning} ${refinedWarning}`.trim(),
+  };
 }
 
 function errorResponse(res, status, code, message) {
@@ -115,7 +267,18 @@ router.post('/', async (req, res) => {
 
     const rawResult = await analyzeIngredients(sanitizedText);
     const parsed = parseAIResponse(rawResult, sanitizedText);
-    const verified = await verifyParsedIngredientsOnline(parsed);
+    const candidates = [
+      ...(Array.isArray(parsed?.safeIngredients) ? parsed.safeIngredients : []),
+      ...((Array.isArray(parsed?.riskyIngredients) ? parsed.riskyIngredients : []).map(
+        (item) => item?.name
+      )),
+      ...((Array.isArray(parsed?.riskyIngredients) ? parsed.riskyIngredients : []).flatMap((item) =>
+        Array.isArray(item?.aliases) ? item.aliases : []
+      )),
+    ];
+    const refinedDetected = await refineDetectedIngredientsWithAI(sanitizedText, candidates);
+    const refinedParsed = refineParsedByAIDetected(parsed, refinedDetected);
+    const verified = await verifyParsedIngredientsOnline(refinedParsed);
     const stabilized = await stabilizeWithIngredientMemory(verified, {
       forceInternetRecheck: true,
     });
