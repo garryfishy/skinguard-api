@@ -82,6 +82,10 @@ const CONDITIONAL_CAUTION_KEYS = new Set([
   'paraben',
 ]);
 
+function isKnownRiskKey(key) {
+  return DEFINITELY_DANGEROUS_KEYS.has(key) || CONDITIONAL_CAUTION_KEYS.has(key);
+}
+
 const ALIAS_TO_CANONICAL = Object.entries(CANONICAL_ALIASES).reduce((acc, [canonical, aliases]) => {
   acc[canonical] = canonical;
   for (const alias of aliases) {
@@ -384,6 +388,26 @@ function normalizeIngredient(item) {
   };
 }
 
+function isGenericRiskText(text) {
+  const value = String(text || '').trim().toLowerCase();
+  if (!value) {
+    return true;
+  }
+  return value === 'no description available' || value === 'x' || value === '-';
+}
+
+function isGenericSeverityReason(text) {
+  const value = String(text || '').trim().toLowerCase();
+  if (!value) {
+    return true;
+  }
+  return (
+    value.includes('potential concern identified') ||
+    value.includes('moderate risk due to possible irritation') ||
+    value.includes('lower risk in typical use')
+  );
+}
+
 function buildDetectedIngredientIndex(detectedIngredients) {
   const indexMap = new Map();
   detectedIngredients.forEach((item, index) => {
@@ -407,20 +431,23 @@ function findIngredientIndex(item, detectedIndexMap) {
   return Number.isFinite(best) ? best : -1;
 }
 
-function hasHighConcentrationHint(item, ingredientIndex) {
-  if (ingredientIndex !== -1 && ingredientIndex <= 2) {
+function hasHighConcentrationHint(item, ingredientIndex, key = '') {
+  if (ingredientIndex === 0) {
     return true;
   }
 
-  const text = `${item.risk || ''} ${item.severityReason || ''}`.toLowerCase();
-  return /kadar tinggi|konsentrasi tinggi|high concentration|high amount|tinggi dalam komposisi/.test(text);
+  if (ingredientIndex === 1 && key === 'alcohol') {
+    return true;
+  }
+
+  return false;
 }
 
 function computeRecommendation(item, ingredientIndex) {
   const key = canonicalKey(item.name);
   const definitelyDangerous = DEFINITELY_DANGEROUS_KEYS.has(key);
   const conditional = CONDITIONAL_CAUTION_KEYS.has(key);
-  const highConcentrationLikely = hasHighConcentrationHint(item, ingredientIndex);
+  const highConcentrationLikely = hasHighConcentrationHint(item, ingredientIndex, key);
 
   if (definitelyDangerous) {
     return {
@@ -467,6 +494,72 @@ function computeRecommendation(item, ingredientIndex) {
     reason:
       'Secara umum masih layak dibeli, namun tetap gunakan sesuai petunjuk dan hentikan pemakaian jika muncul iritasi.',
   };
+}
+
+function applyDeterministicRiskProfile(item, ingredientIndex) {
+  const key = canonicalKey(item.name);
+  const highConcentrationLikely = hasHighConcentrationHint(item, ingredientIndex, key);
+  const profiled = { ...item };
+
+  if (DEFINITELY_DANGEROUS_KEYS.has(key)) {
+    profiled.severity = 'high';
+    if (isGenericRiskText(profiled.risk)) {
+      profiled.risk =
+        'Bahan ini tergolong berbahaya dalam kosmetik dan dapat menimbulkan dampak kesehatan serius pada paparan berulang.';
+    }
+    profiled.severityReason =
+      'Tingkat risiko tinggi karena bahan ini memiliki profil toksisitas kuat dan umumnya masuk daftar pembatasan/larangan.';
+    profiled.pregnancy = {
+      safe: false,
+      reason:
+        'Tidak aman untuk kehamilan karena ada potensi dampak buruk pada ibu dan perkembangan janin.',
+    };
+    return profiled;
+  }
+
+  if (CONDITIONAL_CAUTION_KEYS.has(key)) {
+    profiled.severity = highConcentrationLikely ? 'high' : 'medium';
+    if (isGenericRiskText(profiled.risk)) {
+      profiled.risk =
+        'Bahan ini bersifat kontekstual: biasanya dipakai sebagai komponen formulasi, tetapi bisa memicu masalah pada kadar tinggi atau kulit sensitif.';
+    }
+    profiled.severityReason = highConcentrationLikely
+      ? 'Risiko tinggi karena bahan ini terindikasi berada pada porsi awal komposisi atau memiliki petunjuk kadar tinggi.'
+      : 'Risiko sedang karena dampaknya sangat bergantung pada kadar, frekuensi pemakaian, dan sensitivitas pengguna.';
+    profiled.pregnancy = {
+      safe: false,
+      reason:
+        'Perlu kehati-hatian saat hamil; keamanan sangat bergantung pada kadar dan kondisi individu, konsultasi medis disarankan.',
+    };
+    return profiled;
+  }
+
+  if (profiled.severity === 'high' && isGenericSeverityReason(profiled.severityReason)) {
+    profiled.severityReason =
+      'Risiko dinilai tinggi berdasarkan indikasi toksisitas/iritasi yang signifikan dari bahan ini.';
+  }
+
+  return profiled;
+}
+
+function buildFallbackRiskItem(detectedIngredient, ingredientIndex) {
+  const base = {
+    name: detectedIngredient,
+    aliases: [],
+    risk: 'No description available',
+    severity: 'medium',
+    severityReason: '',
+    pregnancy: {
+      safe: false,
+      reason: '',
+    },
+    recommendation: {
+      safe: null,
+      reason: '',
+    },
+  };
+
+  return applyDeterministicRiskProfile(base, ingredientIndex);
 }
 
 function normalizeRecommendationReason(aiReason, safeValue, fallbackReason) {
@@ -590,12 +683,16 @@ function mergeRiskyIngredients(items) {
 }
 
 function parseAIResponse(rawText, ingredientText = '') {
+  const detectedIngredients = extractDetectedIngredients(ingredientText);
   const fallback = {
     riskyIngredients: [],
-    safeIngredients: [],
-    safeCount: 0,
-    totalDetected: 0,
-    summary: 'Could not reliably extract ingredients.',
+    safeIngredients: detectedIngredients,
+    safeCount: detectedIngredients.length,
+    totalDetected: detectedIngredients.length,
+    summary:
+      detectedIngredients.length > 0
+        ? `0 of ${detectedIngredients.length} detected ingredients are flagged as risky.`
+        : 'Could not reliably extract ingredients.',
     warning: 'AI response was ambiguous. Results may be incomplete.',
   };
 
@@ -611,7 +708,6 @@ function parseAIResponse(rawText, ingredientText = '') {
     return fallback;
   }
 
-  const detectedIngredients = extractDetectedIngredients(ingredientText);
   const ingredientSection = extractIngredientSection(ingredientText);
   let rawIngredients = [];
   let aiTotalDetected = 0;
@@ -644,13 +740,28 @@ function parseAIResponse(rawText, ingredientText = '') {
     return isIngredientMentionedInSource(item, detectedKeySet, ingredientSection);
   });
   const detectedIndexMap = buildDetectedIngredientIndex(detectedIngredients);
-  const riskyIngredients = riskyIngredientsInputMatched.map((item) => {
+  const riskyMap = new Map();
+  for (const item of riskyIngredientsInputMatched) {
+    riskyMap.set(canonicalKey(item.name), item);
+  }
+
+  for (const ingredient of detectedIngredients) {
+    const key = canonicalKey(ingredient);
+    if (!isKnownRiskKey(key) || riskyMap.has(key)) {
+      continue;
+    }
+    const ingredientIndex = detectedIndexMap.get(key) ?? -1;
+    riskyMap.set(key, buildFallbackRiskItem(ingredient, ingredientIndex));
+  }
+
+  const riskyIngredients = Array.from(riskyMap.values()).map((item) => {
     const index = findIngredientIndex(item, detectedIndexMap);
-    const computedRecommendation = computeRecommendation(item, index);
+    const profiledItem = applyDeterministicRiskProfile(item, index);
+    const computedRecommendation = computeRecommendation(profiledItem, index);
     const aiReason = String(item?.recommendation?.reason || '').trim();
 
     return {
-      ...item,
+      ...profiledItem,
       recommendation: {
         safe: computedRecommendation.safe,
         reason: normalizeRecommendationReason(

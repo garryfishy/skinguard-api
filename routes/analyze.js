@@ -4,6 +4,41 @@ const { parseAIResponse } = require('../utils/parseAIResponse');
 const { verifyParsedIngredientsOnline } = require('../utils/verifyIngredientOnline');
 
 const router = express.Router();
+const ANALYSIS_CACHE_TTL_MS = Number(process.env.ANALYSIS_CACHE_TTL_MS || 30 * 60 * 1000);
+const MAX_ANALYSIS_CACHE_SIZE = 500;
+const analysisCache = new Map();
+
+function normalizeCacheKey(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function getCachedAnalysis(key) {
+  const cached = analysisCache.get(key);
+  if (!cached) {
+    return null;
+  }
+
+  if (Date.now() - cached.ts > ANALYSIS_CACHE_TTL_MS) {
+    analysisCache.delete(key);
+    return null;
+  }
+
+  return cached.data;
+}
+
+function setCachedAnalysis(key, data) {
+  if (analysisCache.size >= MAX_ANALYSIS_CACHE_SIZE) {
+    const oldestKey = analysisCache.keys().next().value;
+    if (oldestKey) {
+      analysisCache.delete(oldestKey);
+    }
+  }
+
+  analysisCache.set(key, { data, ts: Date.now() });
+}
 
 function errorResponse(res, status, code, message) {
   return res.status(status).json({
@@ -57,9 +92,26 @@ router.post('/', async (req, res) => {
     }
 
     const startedAt = Date.now();
+    const cacheKey = normalizeCacheKey(sanitizedText);
+    const cachedData = getCachedAnalysis(cacheKey);
+    if (cachedData) {
+      return res.status(200).json({
+        success: true,
+        data: cachedData,
+        meta: {
+          model: HF_MODEL_ID,
+          analysisTimeMs: Date.now() - startedAt,
+          cacheHit: true,
+        },
+      });
+    }
+
     const rawResult = await analyzeIngredients(sanitizedText);
     const parsed = parseAIResponse(rawResult, sanitizedText);
     const verified = await verifyParsedIngredientsOnline(parsed);
+    if (Number(verified?.totalDetected || 0) > 0) {
+      setCachedAnalysis(cacheKey, verified);
+    }
 
     return res.status(200).json({
       success: true,

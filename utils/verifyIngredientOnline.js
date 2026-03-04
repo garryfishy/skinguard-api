@@ -71,6 +71,8 @@ function canonicalizeText(value) {
   return String(value || '')
     .replace(/\([^)]*\)/g, ' ')
     .replace(/[%]/g, ' ')
+    .replace(/[,:;]+/g, ' ')
+    .replace(/[.]+$/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
