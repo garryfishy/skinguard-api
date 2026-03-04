@@ -1,8 +1,9 @@
 const PUBCHEM_BASE_URL = 'https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name';
 const PUBCHEM_GHS_BASE_URL = 'https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound';
 const {
-  isDatasetIngredient,
+  INGREDIENT_CLASSIFICATIONS,
   isDatasetDangerousIngredient,
+  classifyIngredientName,
 } = require('./ingredientDataset');
 const {
   isKnownNonIngredient,
@@ -18,6 +19,20 @@ const CANDIDATE_VALIDITY = Object.freeze({
   INVALID: 'invalid',
   UNKNOWN: 'unknown',
 });
+const OUTPUT_CLASSIFICATIONS = new Set([
+  INGREDIENT_CLASSIFICATIONS.SAFE,
+  INGREDIENT_CLASSIFICATIONS.BOTANICAL,
+  INGREDIENT_CLASSIFICATIONS.FAMILY_INGREDIENT,
+  INGREDIENT_CLASSIFICATIONS.FUZZY_MATCH,
+  INGREDIENT_CLASSIFICATIONS.DANGEROUS,
+]);
+const CLASSIFICATION_PRIORITY = {
+  [INGREDIENT_CLASSIFICATIONS.DANGEROUS]: 5,
+  [INGREDIENT_CLASSIFICATIONS.FUZZY_MATCH]: 4,
+  [INGREDIENT_CLASSIFICATIONS.FAMILY_INGREDIENT]: 3,
+  [INGREDIENT_CLASSIFICATIONS.BOTANICAL]: 2,
+  [INGREDIENT_CLASSIFICATIONS.SAFE]: 1,
+};
 
 const HIGH_IMPACT_GHS_CODES = new Set([
   'H300',
@@ -157,10 +172,6 @@ function isWeakUntrustedToken(value) {
   return token.length <= 6;
 }
 
-function isKnownIngredientCandidate(candidate) {
-  return isDatasetIngredient(candidate);
-}
-
 function buildCandidateList(name, aliases = []) {
   const raw = [name, ...aliases];
   const unique = [];
@@ -182,6 +193,86 @@ function buildCandidateList(name, aliases = []) {
   }
 
   return unique.slice(0, 5);
+}
+
+function normalizeClassificationValue(value, fallback = INGREDIENT_CLASSIFICATIONS.SAFE) {
+  const normalized = String(value || '').trim().toUpperCase();
+  if (OUTPUT_CLASSIFICATIONS.has(normalized)) {
+    return normalized;
+  }
+  return fallback;
+}
+
+function buildCandidateClassification(candidate, classified) {
+  if (!classified || typeof classified !== 'object') {
+    return null;
+  }
+
+  if (!classified.isIngredient) {
+    return null;
+  }
+
+  const canonicalName = String(
+    classified.canonicalName || classified.matchedName || candidate || ''
+  ).trim();
+  if (!canonicalName) {
+    return null;
+  }
+
+  return {
+    classification: normalizeClassificationValue(
+      classified.classification,
+      INGREDIENT_CLASSIFICATIONS.SAFE
+    ),
+    confidence: Number(classified.confidence || 0),
+    source: String(classified.source || classified.matchType || 'rule'),
+    matchType: String(classified.matchType || ''),
+    matchedName: String(classified.matchedName || canonicalName),
+    canonicalName,
+    family: String(classified.family || ''),
+  };
+}
+
+function classificationPriority(value) {
+  const key = normalizeClassificationValue(value, '');
+  return Number(CLASSIFICATION_PRIORITY[key] || 0);
+}
+
+function pickBetterClassification(current, candidate) {
+  if (!candidate) {
+    return current;
+  }
+
+  if (!current) {
+    return candidate;
+  }
+
+  const currentPriority = classificationPriority(current.classification);
+  const candidatePriority = classificationPriority(candidate.classification);
+  if (candidatePriority > currentPriority) {
+    return candidate;
+  }
+
+  if (candidatePriority < currentPriority) {
+    return current;
+  }
+
+  return Number(candidate.confidence || 0) > Number(current.confidence || 0)
+    ? candidate
+    : current;
+}
+
+function defaultSafeClassification(name, source = 'pubchem') {
+  const canonicalName = canonicalizeText(name);
+  return {
+    classification: INGREDIENT_CLASSIFICATIONS.SAFE,
+    confidence: 0.86,
+    source,
+    matchType: source === 'pubchem' ? 'verification' : source,
+    matchedName: canonicalName,
+    canonicalName,
+    family: '',
+  };
 }
 
 function getCachedValue(cache, key) {
@@ -326,7 +417,7 @@ async function doubleCheckIngredientSafetyOnline(name, aliases = [], options = {
     return {
       status: 'unknown',
       source: 'validation',
-      reason: 'Data bahan tidak cukup untuk verifikasi online.',
+      reason: 'Data bahan tidak cukup untuk pengecekan tambahan.',
       codes: [],
     };
   }
@@ -390,7 +481,7 @@ async function doubleCheckIngredientSafetyOnline(name, aliases = [], options = {
     return {
       status: 'safe',
       source: 'pubchem',
-      reason: 'Tidak ditemukan kode bahaya GHS berat pada referensi online yang tersedia.',
+      reason: 'Tidak ditemukan kode bahaya GHS berat pada referensi tambahan yang tersedia.',
       codes: [],
     };
   }
@@ -398,7 +489,7 @@ async function doubleCheckIngredientSafetyOnline(name, aliases = [], options = {
   return {
     status: 'unknown',
     source: 'pubchem',
-    reason: 'Verifikasi online tidak konklusif untuk bahan ini.',
+    reason: 'Pengecekan tambahan belum konklusif untuk bahan ini.',
     codes: [],
   };
 }
@@ -448,21 +539,45 @@ async function lookupPubChem(name) {
 
 async function verifyIngredientCandidates(candidates, budget) {
   if (candidates.length === 0) {
-    return CANDIDATE_VALIDITY.INVALID;
+    return {
+      validity: CANDIDATE_VALIDITY.INVALID,
+      classification: null,
+    };
   }
 
   if (candidates.some((candidate) => isKnownNonIngredient(candidate))) {
-    return CANDIDATE_VALIDITY.INVALID;
+    return {
+      validity: CANDIDATE_VALIDITY.INVALID,
+      classification: null,
+    };
   }
 
+  let bestClassification = null;
   for (const candidate of candidates) {
-    if (isKnownIngredientCandidate(candidate)) {
-      return CANDIDATE_VALIDITY.VALID;
+    const classified = classifyIngredientName(candidate, {
+      fuzzyThreshold: Number(process.env.INGREDIENT_FUZZY_THRESHOLD || 0.85),
+    });
+    const candidateClassification = buildCandidateClassification(candidate, classified);
+    bestClassification = pickBetterClassification(bestClassification, candidateClassification);
+    if (
+      candidateClassification &&
+      candidateClassification.classification === INGREDIENT_CLASSIFICATIONS.DANGEROUS
+    ) {
+      break;
     }
+  }
+  if (bestClassification) {
+    return {
+      validity: CANDIDATE_VALIDITY.VALID,
+      classification: bestClassification,
+    };
   }
 
   if (isWeakUntrustedToken(candidates[0])) {
-    return CANDIDATE_VALIDITY.INVALID;
+    return {
+      validity: CANDIDATE_VALIDITY.INVALID,
+      classification: null,
+    };
   }
 
   let hasUnknown = false;
@@ -474,7 +589,10 @@ async function verifyIngredientCandidates(candidates, budget) {
     budget.remaining -= 1;
     const result = await lookupPubChem(candidate);
     if (result === true) {
-      return CANDIDATE_VALIDITY.VALID;
+      return {
+        validity: CANDIDATE_VALIDITY.VALID,
+        classification: defaultSafeClassification(candidate, 'pubchem'),
+      };
     }
     if (result === null) {
       hasUnknown = true;
@@ -482,10 +600,16 @@ async function verifyIngredientCandidates(candidates, budget) {
   }
 
   if (hasUnknown) {
-    return CANDIDATE_VALIDITY.UNKNOWN;
+    return {
+      validity: CANDIDATE_VALIDITY.UNKNOWN,
+      classification: null,
+    };
   }
 
-  return CANDIDATE_VALIDITY.INVALID;
+  return {
+    validity: CANDIDATE_VALIDITY.INVALID,
+    classification: null,
+  };
 }
 
 async function mapWithConcurrency(items, limit, mapper) {
@@ -531,6 +655,93 @@ function dedupeStrings(items) {
   return unique;
 }
 
+function upsertIngredientClassification(map, name, classificationInfo) {
+  const canonicalName = canonicalizeText(name);
+  if (!canonicalName) {
+    return;
+  }
+
+  const key = normalizeKey(canonicalName);
+  if (!key) {
+    return;
+  }
+
+  const normalizedClassification = normalizeClassificationValue(
+    classificationInfo?.classification,
+    INGREDIENT_CLASSIFICATIONS.SAFE
+  );
+  const next = {
+    name: canonicalName,
+    classification: normalizedClassification,
+    source: String(classificationInfo?.source || 'rule'),
+    matchType: String(classificationInfo?.matchType || ''),
+    confidence: Number(classificationInfo?.confidence || 0),
+    matchedName: canonicalizeText(classificationInfo?.matchedName || canonicalName),
+    family: String(classificationInfo?.family || ''),
+  };
+
+  const current = map.get(key);
+  if (!current) {
+    map.set(key, next);
+    return;
+  }
+
+  const nextPriority = classificationPriority(next.classification);
+  const currentPriority = classificationPriority(current.classification);
+  if (nextPriority > currentPriority) {
+    map.set(key, next);
+    return;
+  }
+
+  if (nextPriority === currentPriority && next.confidence > current.confidence) {
+    map.set(key, next);
+  }
+}
+
+function buildIngredientClassificationOutput(riskyIngredients, safeIngredients, classificationMap) {
+  const output = [];
+  const seen = new Set();
+
+  const appendClassification = (name, fallbackClassification) => {
+    const canonicalName = canonicalizeText(name);
+    const key = normalizeKey(canonicalName);
+    if (!canonicalName || !key || seen.has(key)) {
+      return;
+    }
+
+    seen.add(key);
+    const existing = classificationMap.get(key);
+    if (existing) {
+      output.push(existing);
+      return;
+    }
+
+    const classified = classifyIngredientName(canonicalName);
+    const classification = normalizeClassificationValue(
+      classified?.classification,
+      fallbackClassification
+    );
+    output.push({
+      name: canonicalName,
+      classification,
+      source: String(classified?.source || 'rule'),
+      matchType: String(classified?.matchType || ''),
+      confidence: Number(classified?.confidence || 0),
+      matchedName: canonicalizeText(classified?.matchedName || canonicalName),
+      family: String(classified?.family || ''),
+    });
+  };
+
+  for (const item of riskyIngredients) {
+    appendClassification(item?.name, INGREDIENT_CLASSIFICATIONS.DANGEROUS);
+  }
+  for (const safeName of safeIngredients) {
+    appendClassification(safeName, INGREDIENT_CLASSIFICATIONS.SAFE);
+  }
+
+  return output;
+}
+
 function recomputeSummary(riskyCount, totalDetected) {
   return `${riskyCount} of ${totalDetected} detected ingredients are flagged as risky.`;
 }
@@ -541,6 +752,7 @@ async function verifyParsedIngredientsOnline(parsedData) {
   }
 
   const budget = { remaining: MAX_ONLINE_LOOKUPS };
+  const classificationMap = new Map();
   let removedInvalidCount = 0;
   let removedUnknownCount = 0;
 
@@ -555,9 +767,9 @@ async function verifyParsedIngredientsOnline(parsedData) {
       return null;
     }
 
-    const validity = await verifyIngredientCandidates(candidates, budget);
-    if (validity !== CANDIDATE_VALIDITY.VALID) {
-      if (validity === CANDIDATE_VALIDITY.UNKNOWN) {
+    const verification = await verifyIngredientCandidates(candidates, budget);
+    if (verification.validity !== CANDIDATE_VALIDITY.VALID) {
+      if (verification.validity === CANDIDATE_VALIDITY.UNKNOWN) {
         removedUnknownCount += 1;
       } else {
         removedInvalidCount += 1;
@@ -565,10 +777,22 @@ async function verifyParsedIngredientsOnline(parsedData) {
       return null;
     }
 
+    const classificationInfo = verification.classification || defaultSafeClassification(item?.name);
+    const preferredName =
+      classificationInfo.matchType === 'keyword'
+        ? item?.name
+        : classificationInfo.canonicalName || item?.name;
+    const outputName = canonicalizeText(preferredName);
+    upsertIngredientClassification(classificationMap, outputName, classificationInfo);
+
     return {
       ...item,
-      name: canonicalizeText(item.name),
+      name: outputName,
       aliases: dedupeStrings(Array.isArray(item.aliases) ? item.aliases : []),
+      classification: normalizeClassificationValue(
+        classificationInfo.classification,
+        INGREDIENT_CLASSIFICATIONS.DANGEROUS
+      ),
     };
   });
 
@@ -585,9 +809,9 @@ async function verifyParsedIngredientsOnline(parsedData) {
           return null;
         }
 
-        const validity = await verifyIngredientCandidates(candidates, budget);
-        if (validity !== CANDIDATE_VALIDITY.VALID) {
-          if (validity === CANDIDATE_VALIDITY.UNKNOWN) {
+        const verification = await verifyIngredientCandidates(candidates, budget);
+        if (verification.validity !== CANDIDATE_VALIDITY.VALID) {
+          if (verification.validity === CANDIDATE_VALIDITY.UNKNOWN) {
             removedUnknownCount += 1;
           } else {
             removedInvalidCount += 1;
@@ -595,13 +819,25 @@ async function verifyParsedIngredientsOnline(parsedData) {
           return null;
         }
 
-        return canonicalizeText(name);
+        const classificationInfo = verification.classification || defaultSafeClassification(name);
+        const shouldUseCanonical = classificationInfo.matchType === 'exact' || classificationInfo.matchType === 'fuzzy';
+        const outputName = canonicalizeText(
+          shouldUseCanonical ? classificationInfo.canonicalName || name : name
+        );
+        upsertIngredientClassification(classificationMap, outputName, classificationInfo);
+
+        return outputName;
       })
     ).filter(Boolean)
   ).filter((name) => !riskyKeys.has(normalizeKey(name)));
   const totalDetected = verifiedRisky.length + verifiedSafe.length;
   const safeCount = verifiedSafe.length;
   const summary = recomputeSummary(verifiedRisky.length, totalDetected);
+  const ingredientClassifications = buildIngredientClassificationOutput(
+    verifiedRisky,
+    verifiedSafe,
+    classificationMap
+  );
 
   let warning = parsedData.warning ? String(parsedData.warning) : '';
   if (removedInvalidCount > 0) {
@@ -609,7 +845,7 @@ async function verifyParsedIngredientsOnline(parsedData) {
     warning = warning ? `${warning} ${extra}` : extra;
   }
   if (removedUnknownCount > 0) {
-    const extra = `${removedUnknownCount} item tidak disertakan karena verifikasi online tidak konklusif.`;
+    const extra = `${removedUnknownCount} item tidak disertakan karena pengecekan tambahan belum konklusif.`;
     warning = warning ? `${warning} ${extra}` : extra;
   }
 
@@ -620,6 +856,7 @@ async function verifyParsedIngredientsOnline(parsedData) {
     safeCount,
     totalDetected,
     summary,
+    ingredientClassifications,
   };
 
   delete result.aiDetectedValidated;

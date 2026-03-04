@@ -5,11 +5,44 @@ const DATASET_CANDIDATE_PATHS = [
   process.env.INGREDIENT_DATASET_PATH
     ? path.resolve(process.cwd(), process.env.INGREDIENT_DATASET_PATH)
     : '',
+  path.join(__dirname, '..', 'skinguard_ingredients_dataset_12000.csv'),
   path.join(__dirname, '..', 'skinguard_ingredients_dataset_8000.csv'),
   path.join(__dirname, '..', 'cosmetic_ingredients_dataset_8000_en_id.csv'),
   path.join(__dirname, '..', 'cosmetic_ingredients_dataset_5000_en_id.csv'),
 ].filter(Boolean);
 
+const INGREDIENT_CLASSIFICATIONS = Object.freeze({
+  SAFE: 'SAFE',
+  BOTANICAL: 'BOTANICAL',
+  FAMILY_INGREDIENT: 'FAMILY_INGREDIENT',
+  FUZZY_MATCH: 'FUZZY_MATCH',
+  DANGEROUS: 'DANGEROUS',
+  UNKNOWN: 'UNKNOWN',
+});
+
+const FUZZY_THRESHOLD_DEFAULT = Number(process.env.INGREDIENT_FUZZY_THRESHOLD || 0.85);
+const BOTANICAL_KEYWORDS = new Set([
+  'extract',
+  'leaf',
+  'root',
+  'fruit',
+  'seed',
+  'flower',
+  'juice',
+  'oil',
+]);
+const DANGEROUS_KEYWORD_ALIASES = {
+  mercury: ['mercury', 'merkuri', 'raksa', 'hg', 'mercuric chloride', 'mercury chloride'],
+  lead: ['lead', 'timbal', 'pb'],
+  arsenic: ['arsenic', 'arsen'],
+  cadmium: ['cadmium', 'kadmium'],
+  thallium: ['thallium', 'talium'],
+  hydroquinone: ['hydroquinone', 'hidrokuinon', 'hydroquinon'],
+  'retinoic acid': ['retinoic acid', 'asam retinoat', 'tretinoin'],
+  clobetasol: ['clobetasol', 'clobetasol propionate'],
+  betamethasone: ['betamethasone', 'betametason'],
+  'rhodamine b': ['rhodamine b', 'rhodamin b', 'rhoda min b', 'rhoda mine b'],
+};
 const DANGEROUS_ALIAS_OVERRIDES = {
   mercury: ['merkuri', 'raksa', 'hg'],
   hydroquinone: ['hidrokuinon', 'hydroquinon'],
@@ -19,6 +52,8 @@ const DANGEROUS_ALIAS_OVERRIDES = {
   tretinoin: ['retinoic acid', 'asam retinoat'],
   clobetasol: ['clobetasol propionate'],
   cadmium: ['kadmium'],
+  thallium: ['talium'],
+  betamethasone: ['betametason'],
 };
 
 let isLoaded = false;
@@ -29,15 +64,48 @@ let dangerousRows = 0;
 let resolvedDatasetPath = '';
 
 const keyToEntry = new Map();
+const compactKeyToEntry = new Map();
+const fuzzyRecords = [];
+const fuzzySearchCache = new Map();
+const classificationCache = new Map();
+
+function clampThreshold(value, fallback) {
+  if (!Number.isFinite(value)) {
+    return fallback;
+  }
+
+  if (value < 0.5) {
+    return 0.5;
+  }
+
+  if (value > 0.99) {
+    return 0.99;
+  }
+
+  return value;
+}
 
 function normalizeIngredientKey(value) {
   return String(value || '')
     .normalize('NFKD')
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/[‐‑‒–—―]/g, '-')
+    .replace(/[’'`"]/g, '')
+    .replace(/[()/,[\]{}:%+;]+/g, ' ')
+    .replace(/[\\]/g, ' ')
+    .replace(/-/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\bpeg\s+(\d{1,4})\b/g, 'peg$1')
+    .replace(/\b([a-z]{1,8})\s+(\d{1,4})\b/g, '$1$2')
+    .replace(/\b(\d{1,4})\s+([a-z]{1,8})\b/g, '$1$2')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function normalizeIngredientCompactKey(value) {
+  return normalizeIngredientKey(value).replace(/\s+/g, '');
 }
 
 function parseBoolean(value) {
@@ -93,13 +161,22 @@ function mergeEntry(base, incoming) {
 }
 
 function addEntryKey(name, entry) {
-  const key = normalizeIngredientKey(name);
-  if (!key) {
+  const normalizedKey = normalizeIngredientKey(name);
+  if (!normalizedKey) {
     return;
   }
 
-  const existing = keyToEntry.get(key);
-  keyToEntry.set(key, mergeEntry(existing, entry));
+  const existingByKey = keyToEntry.get(normalizedKey);
+  const merged = mergeEntry(existingByKey, entry);
+  keyToEntry.set(normalizedKey, merged);
+
+  const compactKey = normalizeIngredientCompactKey(normalizedKey);
+  if (!compactKey) {
+    return;
+  }
+
+  const existingByCompact = compactKeyToEntry.get(compactKey);
+  compactKeyToEntry.set(compactKey, mergeEntry(existingByCompact, merged));
 }
 
 function resolveDatasetPath() {
@@ -145,6 +222,26 @@ function applyDangerousAliasOverrides() {
   }
 }
 
+function rebuildFuzzyRecords() {
+  fuzzyRecords.length = 0;
+  fuzzySearchCache.clear();
+  classificationCache.clear();
+
+  for (const [key, entry] of keyToEntry.entries()) {
+    const compact = normalizeIngredientCompactKey(key);
+    if (!compact) {
+      continue;
+    }
+
+    fuzzyRecords.push({
+      key,
+      compact,
+      length: compact.length,
+      entry,
+    });
+  }
+}
+
 function loadIngredientDataset() {
   if (isLoaded) {
     return;
@@ -156,10 +253,16 @@ function loadIngredientDataset() {
   totalRows = 0;
   dangerousRows = 0;
   resolvedDatasetPath = resolveDatasetPath();
+  keyToEntry.clear();
+  compactKeyToEntry.clear();
+  fuzzyRecords.length = 0;
+  fuzzySearchCache.clear();
+  classificationCache.clear();
 
   try {
     if (!resolvedDatasetPath || !fs.existsSync(resolvedDatasetPath)) {
       applyDangerousAliasOverrides();
+      rebuildFuzzyRecords();
       return;
     }
 
@@ -172,6 +275,7 @@ function loadIngredientDataset() {
 
     if (lines.length <= 1) {
       applyDangerousAliasOverrides();
+      rebuildFuzzyRecords();
       return;
     }
 
@@ -183,6 +287,7 @@ function loadIngredientDataset() {
     if (englishIdx === -1 || indonesianIdx === -1 || dangerousIdx === -1) {
       loadError = 'Invalid dataset header';
       applyDangerousAliasOverrides();
+      rebuildFuzzyRecords();
       return;
     }
 
@@ -216,20 +321,32 @@ function loadIngredientDataset() {
     }
 
     applyDangerousAliasOverrides();
+    rebuildFuzzyRecords();
   } catch (error) {
     loadError = String(error?.message || error);
     applyDangerousAliasOverrides();
+    rebuildFuzzyRecords();
   }
 }
 
 function lookupIngredientInDataset(name) {
   loadIngredientDataset();
-  const key = normalizeIngredientKey(name);
-  if (!key) {
+  const normalizedKey = normalizeIngredientKey(name);
+  if (!normalizedKey) {
     return null;
   }
 
-  return keyToEntry.get(key) || null;
+  const entryByKey = keyToEntry.get(normalizedKey);
+  if (entryByKey) {
+    return entryByKey;
+  }
+
+  const compactKey = normalizeIngredientCompactKey(normalizedKey);
+  if (!compactKey) {
+    return null;
+  }
+
+  return compactKeyToEntry.get(compactKey) || null;
 }
 
 function isDatasetIngredient(name) {
@@ -267,14 +384,470 @@ function getDatasetAliases(name) {
   return Array.from(new Set(aliases));
 }
 
+function toCanonicalEntryName(entry) {
+  return String(entry?.englishName || entry?.indonesianName || '').trim();
+}
+
 function getDatasetCanonicalKey(name) {
-  const entry = lookupIngredientInDataset(name);
-  if (!entry) {
+  const exact = lookupIngredientInDataset(name);
+  if (exact) {
+    const baseName = toCanonicalEntryName(exact);
+    return normalizeIngredientKey(baseName);
+  }
+
+  const resolved = classifyIngredientName(name, { allowRuleBased: false });
+  if (!resolved || !resolved.entry) {
     return '';
   }
 
-  const baseName = String(entry.englishName || entry.indonesianName || '').trim();
-  return normalizeIngredientKey(baseName);
+  return normalizeIngredientKey(toCanonicalEntryName(resolved.entry));
+}
+
+function levenshteinDistance(a, b) {
+  const source = String(a || '');
+  const target = String(b || '');
+  if (source === target) {
+    return 0;
+  }
+
+  if (!source) {
+    return target.length;
+  }
+
+  if (!target) {
+    return source.length;
+  }
+
+  const prev = new Array(target.length + 1);
+  const curr = new Array(target.length + 1);
+
+  for (let j = 0; j <= target.length; j += 1) {
+    prev[j] = j;
+  }
+
+  for (let i = 1; i <= source.length; i += 1) {
+    curr[0] = i;
+    const sourceChar = source[i - 1];
+    for (let j = 1; j <= target.length; j += 1) {
+      const cost = sourceChar === target[j - 1] ? 0 : 1;
+      curr[j] = Math.min(
+        prev[j] + 1,
+        curr[j - 1] + 1,
+        prev[j - 1] + cost
+      );
+    }
+
+    for (let j = 0; j <= target.length; j += 1) {
+      prev[j] = curr[j];
+    }
+  }
+
+  return prev[target.length];
+}
+
+function levenshteinSimilarity(a, b) {
+  const source = String(a || '');
+  const target = String(b || '');
+  const maxLen = Math.max(source.length, target.length);
+  if (maxLen === 0) {
+    return 1;
+  }
+
+  const distance = levenshteinDistance(source, target);
+  return Math.max(0, 1 - distance / maxLen);
+}
+
+function jaroSimilarity(a, b) {
+  const source = String(a || '');
+  const target = String(b || '');
+  if (source === target) {
+    return 1;
+  }
+
+  const sourceLen = source.length;
+  const targetLen = target.length;
+  if (sourceLen === 0 || targetLen === 0) {
+    return 0;
+  }
+
+  const matchDistance = Math.floor(Math.max(sourceLen, targetLen) / 2) - 1;
+  const sourceMatches = new Array(sourceLen).fill(false);
+  const targetMatches = new Array(targetLen).fill(false);
+  let matches = 0;
+
+  for (let i = 0; i < sourceLen; i += 1) {
+    const start = Math.max(0, i - matchDistance);
+    const end = Math.min(i + matchDistance + 1, targetLen);
+
+    for (let j = start; j < end; j += 1) {
+      if (targetMatches[j]) {
+        continue;
+      }
+      if (source[i] !== target[j]) {
+        continue;
+      }
+      sourceMatches[i] = true;
+      targetMatches[j] = true;
+      matches += 1;
+      break;
+    }
+  }
+
+  if (matches === 0) {
+    return 0;
+  }
+
+  let transpositions = 0;
+  let targetIndex = 0;
+  for (let i = 0; i < sourceLen; i += 1) {
+    if (!sourceMatches[i]) {
+      continue;
+    }
+
+    while (!targetMatches[targetIndex]) {
+      targetIndex += 1;
+    }
+
+    if (source[i] !== target[targetIndex]) {
+      transpositions += 1;
+    }
+    targetIndex += 1;
+  }
+
+  const transpositionHalf = transpositions / 2;
+  return (
+    (matches / sourceLen + matches / targetLen + (matches - transpositionHalf) / matches) / 3
+  );
+}
+
+function jaroWinklerSimilarity(a, b) {
+  const source = String(a || '');
+  const target = String(b || '');
+  const jaro = jaroSimilarity(source, target);
+  if (jaro < 0.7) {
+    return jaro;
+  }
+
+  let prefix = 0;
+  const prefixLimit = Math.min(4, source.length, target.length);
+  while (prefix < prefixLimit && source[prefix] === target[prefix]) {
+    prefix += 1;
+  }
+
+  return jaro + prefix * 0.1 * (1 - jaro);
+}
+
+function stringSimilarity(a, b) {
+  const source = String(a || '');
+  const target = String(b || '');
+  if (!source || !target) {
+    return 0;
+  }
+
+  const lev = levenshteinSimilarity(source, target);
+  const jw = jaroWinklerSimilarity(source, target);
+  return Math.max(lev, jw);
+}
+
+function findBestFuzzyDatasetMatch(name, options = {}) {
+  loadIngredientDataset();
+  const threshold = clampThreshold(
+    Number(options.fuzzyThreshold ?? FUZZY_THRESHOLD_DEFAULT),
+    FUZZY_THRESHOLD_DEFAULT
+  );
+  const queryKey = normalizeIngredientKey(name);
+  const queryCompact = normalizeIngredientCompactKey(queryKey);
+  if (!queryCompact || queryCompact.length < 4) {
+    return null;
+  }
+
+  const exact = lookupIngredientInDataset(queryKey);
+  if (exact) {
+    return {
+      score: 1,
+      entry: exact,
+      matchedKey: normalizeIngredientKey(toCanonicalEntryName(exact)),
+    };
+  }
+
+  const cacheKey = `${queryCompact}|${threshold}`;
+  if (fuzzySearchCache.has(cacheKey)) {
+    return fuzzySearchCache.get(cacheKey);
+  }
+
+  const maxLenDelta = Math.max(2, Math.floor(queryCompact.length * 0.35));
+  const firstChar = queryCompact[0];
+  const candidates = [];
+  for (const record of fuzzyRecords) {
+    if (!record || !record.compact) {
+      continue;
+    }
+    if (record.compact[0] !== firstChar) {
+      continue;
+    }
+    if (Math.abs(record.length - queryCompact.length) > maxLenDelta) {
+      continue;
+    }
+    candidates.push(record);
+  }
+
+  const pool = candidates.length > 0 ? candidates : fuzzyRecords;
+  let best = null;
+  for (const record of pool) {
+    const score = stringSimilarity(queryCompact, record.compact);
+    if (!best || score > best.score) {
+      best = {
+        score,
+        entry: record.entry,
+        matchedKey: record.key,
+      };
+    }
+  }
+
+  if (!best || best.score < threshold) {
+    fuzzySearchCache.set(cacheKey, null);
+    return null;
+  }
+
+  fuzzySearchCache.set(cacheKey, best);
+  return best;
+}
+
+function tokenSetFromText(value) {
+  const normalized = normalizeIngredientKey(value);
+  return new Set(normalized.split(/\s+/).filter(Boolean));
+}
+
+function hasTermInText(value, term) {
+  const text = normalizeIngredientKey(value);
+  const normalizedTerm = normalizeIngredientKey(term);
+  if (!text || !normalizedTerm) {
+    return false;
+  }
+
+  if (normalizedTerm.includes(' ')) {
+    const phrase = ` ${normalizedTerm} `;
+    return ` ${text} `.includes(phrase);
+  }
+
+  const tokens = tokenSetFromText(text);
+  return tokens.has(normalizedTerm);
+}
+
+function detectDangerousKeyword(name) {
+  const normalized = normalizeIngredientKey(name);
+  if (!normalized) {
+    return null;
+  }
+
+  for (const [canonical, aliases] of Object.entries(DANGEROUS_KEYWORD_ALIASES)) {
+    for (const alias of aliases) {
+      if (hasTermInText(normalized, alias)) {
+        return {
+          canonical,
+          matchedKeyword: normalizeIngredientKey(alias),
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+function detectIngredientFamily(name) {
+  const normalized = normalizeIngredientKey(name);
+  const compact = normalizeIngredientCompactKey(normalized);
+  if (!normalized || !compact) {
+    return null;
+  }
+
+  if (/^peg\d*/i.test(compact) || compact.startsWith('peg')) {
+    return { family: 'PEG' };
+  }
+
+  if (/\bglycol\b/i.test(normalized) || compact.includes('glycol')) {
+    return { family: 'GLYCOL' };
+  }
+
+  return null;
+}
+
+function isBotanicalIngredientName(name) {
+  const normalized = normalizeIngredientKey(name);
+  if (!normalized) {
+    return false;
+  }
+
+  const tokens = normalized.split(/\s+/).filter(Boolean);
+  if (tokens.length < 2) {
+    return false;
+  }
+
+  return tokens.some((token) => BOTANICAL_KEYWORDS.has(token));
+}
+
+function buildClassificationResponse(inputName, payload = {}) {
+  const response = {
+    input: String(inputName || '').trim(),
+    normalized: normalizeIngredientKey(inputName),
+    classification: payload.classification || INGREDIENT_CLASSIFICATIONS.UNKNOWN,
+    isIngredient: Boolean(payload.isIngredient),
+    isDangerous: Boolean(payload.isDangerous),
+    confidence: Number(payload.confidence || 0),
+    matchType: String(payload.matchType || ''),
+    source: String(payload.source || ''),
+    family: payload.family ? String(payload.family) : '',
+    canonicalName: String(payload.canonicalName || '').trim(),
+    matchedName: String(payload.matchedName || '').trim(),
+    matchedKey: String(payload.matchedKey || '').trim(),
+    entry: payload.entry || null,
+  };
+
+  return response;
+}
+
+function classifyIngredientName(name, options = {}) {
+  loadIngredientDataset();
+
+  const normalized = normalizeIngredientKey(name);
+  const fuzzyThreshold = clampThreshold(
+    Number(options.fuzzyThreshold ?? FUZZY_THRESHOLD_DEFAULT),
+    FUZZY_THRESHOLD_DEFAULT
+  );
+  const allowRuleBased = options.allowRuleBased !== false;
+  const cacheKey = `${normalized}|${fuzzyThreshold}|${allowRuleBased ? 1 : 0}`;
+
+  if (classificationCache.has(cacheKey)) {
+    return classificationCache.get(cacheKey);
+  }
+
+  if (!normalized) {
+    const emptyResult = buildClassificationResponse(name, {
+      classification: INGREDIENT_CLASSIFICATIONS.UNKNOWN,
+      isIngredient: false,
+      source: 'empty',
+    });
+    classificationCache.set(cacheKey, emptyResult);
+    return emptyResult;
+  }
+
+  const exactEntry = lookupIngredientInDataset(normalized);
+  if (exactEntry) {
+    const classification = exactEntry.isDangerous
+      ? INGREDIENT_CLASSIFICATIONS.DANGEROUS
+      : INGREDIENT_CLASSIFICATIONS.SAFE;
+    const exactResult = buildClassificationResponse(name, {
+      classification,
+      isIngredient: true,
+      isDangerous: Boolean(exactEntry.isDangerous),
+      confidence: 1,
+      matchType: 'exact',
+      source: 'dataset',
+      canonicalName: toCanonicalEntryName(exactEntry),
+      matchedName: toCanonicalEntryName(exactEntry),
+      matchedKey: normalizeIngredientKey(toCanonicalEntryName(exactEntry)),
+      entry: exactEntry,
+    });
+    classificationCache.set(cacheKey, exactResult);
+    return exactResult;
+  }
+
+  const dangerousByKeyword = detectDangerousKeyword(normalized);
+  if (dangerousByKeyword) {
+    const dangerResult = buildClassificationResponse(name, {
+      classification: INGREDIENT_CLASSIFICATIONS.DANGEROUS,
+      isIngredient: true,
+      isDangerous: true,
+      confidence: 0.96,
+      matchType: 'keyword',
+      source: 'dangerous_keyword',
+      canonicalName: dangerousByKeyword.canonical,
+      matchedName: dangerousByKeyword.canonical,
+      matchedKey: dangerousByKeyword.matchedKeyword,
+      entry: null,
+    });
+    classificationCache.set(cacheKey, dangerResult);
+    return dangerResult;
+  }
+
+  if (!allowRuleBased) {
+    const unknownResult = buildClassificationResponse(name, {
+      classification: INGREDIENT_CLASSIFICATIONS.UNKNOWN,
+      isIngredient: false,
+      confidence: 0,
+      matchType: 'none',
+      source: 'unresolved',
+    });
+    classificationCache.set(cacheKey, unknownResult);
+    return unknownResult;
+  }
+
+  const family = detectIngredientFamily(normalized);
+  if (family && family.family) {
+    const familyResult = buildClassificationResponse(name, {
+      classification: INGREDIENT_CLASSIFICATIONS.FAMILY_INGREDIENT,
+      isIngredient: true,
+      isDangerous: false,
+      confidence: 0.9,
+      matchType: 'family_rule',
+      source: 'family_rule',
+      family: family.family,
+      canonicalName: String(name || '').trim() || normalized,
+      matchedName: String(name || '').trim() || normalized,
+      matchedKey: normalizeIngredientKey(name),
+      entry: null,
+    });
+    classificationCache.set(cacheKey, familyResult);
+    return familyResult;
+  }
+
+  if (isBotanicalIngredientName(normalized)) {
+    const botanicalResult = buildClassificationResponse(name, {
+      classification: INGREDIENT_CLASSIFICATIONS.BOTANICAL,
+      isIngredient: true,
+      isDangerous: false,
+      confidence: 0.86,
+      matchType: 'botanical_rule',
+      source: 'botanical_rule',
+      canonicalName: String(name || '').trim() || normalized,
+      matchedName: String(name || '').trim() || normalized,
+      matchedKey: normalizeIngredientKey(name),
+      entry: null,
+    });
+    classificationCache.set(cacheKey, botanicalResult);
+    return botanicalResult;
+  }
+
+  const fuzzy = findBestFuzzyDatasetMatch(normalized, { fuzzyThreshold });
+  if (fuzzy && fuzzy.entry) {
+    const isDangerous = Boolean(fuzzy.entry.isDangerous);
+    const fuzzyResult = buildClassificationResponse(name, {
+      classification: isDangerous
+        ? INGREDIENT_CLASSIFICATIONS.DANGEROUS
+        : INGREDIENT_CLASSIFICATIONS.FUZZY_MATCH,
+      isIngredient: true,
+      isDangerous,
+      confidence: Number(fuzzy.score || 0),
+      matchType: 'fuzzy',
+      source: 'dataset_fuzzy',
+      canonicalName: toCanonicalEntryName(fuzzy.entry),
+      matchedName: toCanonicalEntryName(fuzzy.entry),
+      matchedKey: fuzzy.matchedKey,
+      entry: fuzzy.entry,
+    });
+    classificationCache.set(cacheKey, fuzzyResult);
+    return fuzzyResult;
+  }
+
+  const unknownResult = buildClassificationResponse(name, {
+    classification: INGREDIENT_CLASSIFICATIONS.UNKNOWN,
+    isIngredient: false,
+    confidence: 0,
+    matchType: 'none',
+    source: 'unresolved',
+  });
+  classificationCache.set(cacheKey, unknownResult);
+  return unknownResult;
 }
 
 function getIngredientDatasetInfo() {
@@ -287,11 +860,16 @@ function getIngredientDatasetInfo() {
     totalRows,
     dangerousRows,
     indexedNames: keyToEntry.size,
+    indexedCompactNames: compactKeyToEntry.size,
+    fuzzyRecords: fuzzyRecords.length,
+    fuzzyThresholdDefault: clampThreshold(FUZZY_THRESHOLD_DEFAULT, 0.85),
   };
 }
 
 module.exports = {
+  INGREDIENT_CLASSIFICATIONS,
   normalizeIngredientKey,
+  normalizeIngredientCompactKey,
   lookupIngredientInDataset,
   isDatasetIngredient,
   isDatasetDangerousIngredient,
@@ -299,4 +877,10 @@ module.exports = {
   getDatasetAliases,
   getDatasetCanonicalKey,
   getIngredientDatasetInfo,
+  classifyIngredientName,
+  findBestFuzzyDatasetMatch,
+  detectDangerousKeyword,
+  detectIngredientFamily,
+  isBotanicalIngredientName,
+  stringSimilarity,
 };

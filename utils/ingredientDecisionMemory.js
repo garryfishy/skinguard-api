@@ -293,12 +293,12 @@ function buildRiskItemFromOnlineCheck(name, check) {
     aliases: [],
     risk: String(
       check?.reason ||
-        'Bahan ini memiliki indikator bahaya dari referensi online sehingga perlu kehati-hatian tinggi.'
+        'Bahan ini memiliki indikator bahaya dari referensi tambahan sehingga perlu kehati-hatian tinggi.'
     ),
     severity: hardUnsafe ? 'high' : 'medium',
     severityReason: hardUnsafe
-      ? 'Terdapat kode bahaya GHS berdampak tinggi pada referensi online.'
-      : 'Terdapat indikator kehati-hatian pada referensi online sehingga risikonya kontekstual (bergantung kadar/formulasi).',
+      ? 'Terdapat kode bahaya GHS berdampak tinggi pada referensi tambahan.'
+      : 'Terdapat indikator kehati-hatian pada referensi tambahan sehingga risikonya kontekstual (bergantung kadar/formulasi).',
     pregnancy: {
       safe: false,
       reason: hardUnsafe
@@ -323,9 +323,9 @@ function strengthenRiskItemWithOnlineCheck(item, check) {
   const keepHigh = item.severity === 'high' && hardUnsafe;
   const severity = hardUnsafe || keepHigh ? 'high' : 'medium';
   const severityReason = hardUnsafe
-    ? 'Verifikasi internet menemukan indikator bahaya berdampak tinggi.'
+    ? 'Pengecekan tambahan menemukan indikator bahaya berdampak tinggi.'
     : item.severityReason ||
-      'Verifikasi internet menunjukkan level kehati-hatian, sehingga penilaian bergantung kadar/formulasi.';
+      'Pengecekan tambahan menunjukkan level kehati-hatian, sehingga penilaian bergantung kadar/formulasi.';
   const recommendationSafe = hardUnsafe ? false : true;
   const recommendationReason = hardUnsafe
     ? 'Tidak direkomendasikan sampai ada bukti kadar/formulasi yang jelas dan evaluasi lebih lanjut.'
@@ -660,11 +660,11 @@ async function stabilizeWithIngredientMemory(data, options = {}) {
   const baseWarning = String(data.warning || '').trim();
   const escalateMessage =
     escalatedByInternetCount > 0
-      ? `${escalatedByInternetCount} bahan dipastikan berisiko melalui verifikasi internet tambahan.`
+      ? `${escalatedByInternetCount} bahan dipastikan berisiko melalui pengecekan tambahan.`
       : '';
   const softenMessage =
     softenedByInternetCount > 0
-      ? `${softenedByInternetCount} bahan dilonggarkan ke status kehati-hatian/aman berdasarkan verifikasi internet terbaru.`
+      ? `${softenedByInternetCount} bahan dilonggarkan ke status kehati-hatian/aman berdasarkan pengecekan tambahan terbaru.`
       : '';
 
   const finalWarning = mergeWarnings(

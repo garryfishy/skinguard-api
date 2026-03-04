@@ -7,7 +7,12 @@ const {
 const { parseAIResponse } = require('../utils/parseAIResponse');
 const { verifyParsedIngredientsOnline } = require('../utils/verifyIngredientOnline');
 const { stabilizeWithIngredientMemory } = require('../utils/ingredientDecisionMemory');
-const { isDatasetIngredient, getDatasetCanonicalKey } = require('../utils/ingredientDataset');
+const {
+  INGREDIENT_CLASSIFICATIONS,
+  isDatasetIngredient,
+  getDatasetCanonicalKey,
+  classifyIngredientName,
+} = require('../utils/ingredientDataset');
 const { isKnownNonIngredient, recordNonIngredient } = require('../utils/nonIngredientMemory');
 
 const router = express.Router();
@@ -84,7 +89,10 @@ async function refreshCachedAnalysisInBackground(cacheKey, cachedData) {
       forceInternetRecheck: true,
     });
     if (Number(refreshed?.totalDetected || 0) > 0) {
-      setCachedAnalysis(cacheKey, refreshed, { lastRecheckedAt: Date.now() });
+      const preparedRefreshed = sanitizeUserFacingData(
+        attachIngredientClassifications(refreshed)
+      );
+      setCachedAnalysis(cacheKey, preparedRefreshed, { lastRecheckedAt: Date.now() });
       return;
     }
   } catch (error) {
@@ -107,6 +115,164 @@ function normalizeIngredientKey(value) {
     .replace(/[^a-z0-9\s]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function normalizeClassificationValue(value, fallback = INGREDIENT_CLASSIFICATIONS.SAFE) {
+  const normalized = String(value || '').trim().toUpperCase();
+  if (
+    normalized === INGREDIENT_CLASSIFICATIONS.SAFE ||
+    normalized === INGREDIENT_CLASSIFICATIONS.BOTANICAL ||
+    normalized === INGREDIENT_CLASSIFICATIONS.FAMILY_INGREDIENT ||
+    normalized === INGREDIENT_CLASSIFICATIONS.FUZZY_MATCH ||
+    normalized === INGREDIENT_CLASSIFICATIONS.DANGEROUS
+  ) {
+    return normalized;
+  }
+
+  return fallback;
+}
+
+function sanitizeUserFacingText(value) {
+  return String(value || '')
+    .replace(/verifikasi online/gi, 'pengecekan tambahan')
+    .replace(/verifikasi internet/gi, 'pengecekan tambahan')
+    .replace(/referensi online/gi, 'referensi tambahan')
+    .replace(/referensi internet/gi, 'referensi tambahan');
+}
+
+function sanitizeUserFacingData(data) {
+  if (!data || typeof data !== 'object') {
+    return data;
+  }
+
+  const safeIngredients = Array.isArray(data.safeIngredients) ? data.safeIngredients : [];
+  const riskyIngredients = Array.isArray(data.riskyIngredients) ? data.riskyIngredients : [];
+  const ingredientClassifications = Array.isArray(data.ingredientClassifications)
+    ? data.ingredientClassifications
+    : [];
+
+  return {
+    ...data,
+    warning: data.warning ? sanitizeUserFacingText(data.warning) : data.warning,
+    summary: data.summary ? sanitizeUserFacingText(data.summary) : data.summary,
+    riskyIngredients: riskyIngredients.map((item) => ({
+      ...item,
+      risk: sanitizeUserFacingText(item?.risk || ''),
+      severityReason: sanitizeUserFacingText(item?.severityReason || ''),
+      pregnancy: item?.pregnancy
+        ? {
+            ...item.pregnancy,
+            reason: sanitizeUserFacingText(item.pregnancy.reason || ''),
+          }
+        : item?.pregnancy,
+      recommendation: item?.recommendation
+        ? {
+            ...item.recommendation,
+            reason: sanitizeUserFacingText(item.recommendation.reason || ''),
+          }
+        : item?.recommendation,
+    })),
+    safeIngredients,
+    ingredientClassifications: ingredientClassifications.map((item) => ({
+      ...item,
+      name: String(item?.name || '').trim(),
+      classification: normalizeClassificationValue(item?.classification),
+      source: sanitizeUserFacingText(item?.source || ''),
+      matchType: String(item?.matchType || ''),
+      matchedName: String(item?.matchedName || '').trim(),
+      confidence: Number(item?.confidence || 0),
+      family: String(item?.family || ''),
+    })),
+  };
+}
+
+function attachIngredientClassifications(data) {
+  if (!data || typeof data !== 'object') {
+    return data;
+  }
+
+  const riskyIngredientsInput = Array.isArray(data.riskyIngredients) ? data.riskyIngredients : [];
+  const safeIngredients = Array.isArray(data.safeIngredients) ? data.safeIngredients : [];
+  const classificationMap = new Map();
+  const classificationOrder = [];
+
+  function addClassification(name, classified, fallbackClassification) {
+    const normalizedName = String(name || '').trim();
+    if (!normalizedName) {
+      return;
+    }
+
+    const key = normalizeRefinementKey(normalizedName) || normalizeIngredientKey(normalizedName);
+    if (!key) {
+      return;
+    }
+
+    const next = {
+      name: normalizedName,
+      classification: normalizeClassificationValue(
+        classified?.classification,
+        fallbackClassification
+      ),
+      source: String(classified?.source || 'rule'),
+      matchType: String(classified?.matchType || ''),
+      confidence: Number(classified?.confidence || 0),
+      matchedName: String(classified?.matchedName || classified?.canonicalName || normalizedName),
+      family: String(classified?.family || ''),
+    };
+
+    const current = classificationMap.get(key);
+    if (!current) {
+      classificationMap.set(key, next);
+      classificationOrder.push(key);
+      return;
+    }
+
+    if (
+      next.classification === INGREDIENT_CLASSIFICATIONS.DANGEROUS ||
+      next.confidence > current.confidence
+    ) {
+      classificationMap.set(key, next);
+    }
+  }
+
+  const riskyIngredients = riskyIngredientsInput.map((item) => {
+    const name = String(item?.name || '').trim();
+    const classified = classifyIngredientName(name);
+    const shouldUseCanonical =
+      classified?.matchType === 'exact' || classified?.matchType === 'fuzzy';
+    const classification = normalizeClassificationValue(
+      item?.classification || classified?.classification,
+      INGREDIENT_CLASSIFICATIONS.DANGEROUS
+    );
+    const normalizedItem = {
+      ...item,
+      name: String(
+        shouldUseCanonical ? classified?.canonicalName || name : name || item?.name || ''
+      ).trim(),
+      classification,
+    };
+    addClassification(normalizedItem.name, classified, INGREDIENT_CLASSIFICATIONS.DANGEROUS);
+    return normalizedItem;
+  });
+
+  for (const safeNameRaw of safeIngredients) {
+    const safeName = String(safeNameRaw || '').trim();
+    if (!safeName) {
+      continue;
+    }
+    const classified = classifyIngredientName(safeName);
+    addClassification(safeName, classified, INGREDIENT_CLASSIFICATIONS.SAFE);
+  }
+
+  const ingredientClassifications = classificationOrder
+    .map((key) => classificationMap.get(key))
+    .filter(Boolean);
+
+  return {
+    ...data,
+    riskyIngredients,
+    ingredientClassifications,
+  };
 }
 
 function normalizeCandidateText(value) {
@@ -495,9 +661,12 @@ router.post('/', async (req, res) => {
       if (shouldRecheck) {
         void refreshCachedAnalysisInBackground(cacheKey, cachedEntry.data);
       }
+      const cachedResponseData = sanitizeUserFacingData(
+        attachIngredientClassifications(cachedEntry.data)
+      );
       return res.status(200).json({
         success: true,
-        data: cachedEntry.data,
+        data: cachedResponseData,
         meta: {
           model: HF_MODEL_ID,
           analysisTimeMs: Date.now() - startedAt,
@@ -518,14 +687,17 @@ router.post('/', async (req, res) => {
     const stabilized = await stabilizeWithIngredientMemory(verified, {
       forceInternetRecheck: true,
     });
+    const finalizedData = sanitizeUserFacingData(
+      attachIngredientClassifications(stabilized)
+    );
     learnRejectedCandidates(candidates, stabilized);
-    if (Number(stabilized?.totalDetected || 0) > 0) {
-      setCachedAnalysis(cacheKey, stabilized, { lastRecheckedAt: Date.now() });
+    if (Number(finalizedData?.totalDetected || 0) > 0) {
+      setCachedAnalysis(cacheKey, finalizedData, { lastRecheckedAt: Date.now() });
     }
 
     return res.status(200).json({
       success: true,
-      data: stabilized,
+      data: finalizedData,
       meta: {
         model: HF_MODEL_ID,
         analysisTimeMs: Date.now() - startedAt,
