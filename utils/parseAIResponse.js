@@ -1,6 +1,10 @@
 const NON_INGREDIENT_PATTERNS = [
   /\bmade in\b/i,
+  /\bmadein\b/i,
+  /\bnet\b/i,
   /\bnetto\b/i,
+  /\bnet weight\b/i,
+  /\bisi bersih\b/i,
   /\bexp(iry)?\b/i,
   /\bbatch\b/i,
   /\blot\b/i,
@@ -11,13 +15,18 @@ const NON_INGREDIENT_PATTERNS = [
   /\bwarning\b/i,
   /\bperingatan\b/i,
   /\bmanufactured by\b/i,
+  /\bmanufacturedby\b/i,
   /\bdistributed by\b/i,
+  /\bdistributedby\b/i,
   /\bdiproduksi oleh\b/i,
+  /\bdiproduksioleh\b/i,
   /\bdipasarkan oleh\b/i,
+  /\bdipasarkanoleh\b/i,
   /\bcompany\b/i,
   /\balamat\b/i,
   /\baddress\b/i,
   /\bcustomer service\b/i,
+  /\bcustomerservice\b/i,
   /\bpt\b/i,
   /\bcv\b/i,
   /\bltd\b/i,
@@ -108,7 +117,18 @@ function isLikelyIngredient(token) {
   }
 
   const normalized = token.toLowerCase();
+  const compact = normalized.replace(/[^a-z0-9]/g, '');
   if (NON_INGREDIENT_PATTERNS.some((pattern) => pattern.test(normalized))) {
+    return false;
+  }
+
+  if (
+    /^(netto?|net)\d+(ml|l|g|kg|oz)$/i.test(compact) ||
+    /(?:netto?|net)\d+(ml|l|g|kg|oz)/i.test(compact) ||
+    /^\d+(ml|l|g|kg|oz)$/i.test(compact) ||
+    /^(bpom|batch|lot|exp|expiry|mfg)[a-z0-9-]*$/i.test(compact) ||
+    /(manufacturedby|distributedby|diproduksioleh|dipasarkanoleh|customerservice|madein|forexternaluse|warning|peringatan)/i.test(compact)
+  ) {
     return false;
   }
 
@@ -122,6 +142,16 @@ function isLikelyIngredient(token) {
   }
 
   return /[a-z]/i.test(token);
+}
+
+function stripTrailingMetadata(token) {
+  return String(token || '')
+    .replace(/\b(netto?|net)\s*\d+\s*(ml|l|g|kg|oz)\b.*$/i, '')
+    .replace(
+      /\b(manufactured ?by|manufacturedby|distributed ?by|distributedby|diproduksi ?oleh|diproduksioleh|dipasarkan ?oleh|dipasarkanoleh|bpom|batch|lot|mfg|exp(?:iry)?|warning|peringatan|how to use|cara pakai|alamat|address)\b.*$/i,
+      ''
+    )
+    .trim();
 }
 
 function extractIngredientSection(ingredientText) {
@@ -141,11 +171,17 @@ function extractIngredientSection(ingredientText) {
     'warning',
     'peringatan',
     'manufactured by',
+    'manufacturedby',
     'distributed by',
+    'distributedby',
     'diproduksi oleh',
+    'diproduksioleh',
     'dipasarkan oleh',
+    'dipasarkanoleh',
     'bpom',
+    'net ',
     'netto',
+    'isi bersih',
     'exp',
     'mfg',
     'batch',
@@ -182,10 +218,11 @@ function extractDetectedIngredients(ingredientText) {
   }
 
   const rawItems = cleaned
-    .split(/[,;\n|/]+/)
+    .split(/[,;\n|/]+|\.\s+/)
     .map((part) => part.trim())
     .map((part) => part.replace(/^[\-\d.\s]+/, '').trim())
     .map((part) => part.replace(/^[:\-–—\s]+/, '').trim())
+    .map(stripTrailingMetadata)
     .map((part) => part.replace(/\s{2,}/g, ' '));
 
   const unique = [];
@@ -575,6 +612,7 @@ function parseAIResponse(rawText, ingredientText = '') {
   }
 
   const detectedIngredients = extractDetectedIngredients(ingredientText);
+  const ingredientSection = extractIngredientSection(ingredientText);
   let rawIngredients = [];
   let aiTotalDetected = 0;
 
@@ -603,7 +641,7 @@ function parseAIResponse(rawText, ingredientText = '') {
       return true;
     }
 
-    return isIngredientMentionedInSource(item, detectedKeySet, ingredientText);
+    return isIngredientMentionedInSource(item, detectedKeySet, ingredientSection);
   });
   const detectedIndexMap = buildDetectedIngredientIndex(detectedIngredients);
   const riskyIngredients = riskyIngredientsInputMatched.map((item) => {
