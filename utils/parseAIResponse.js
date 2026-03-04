@@ -16,11 +16,46 @@ const NON_INGREDIENT_PATTERNS = [
 const CANONICAL_ALIASES = {
   mercury: ['merkuri', 'raksa', 'hg', 'mercuric chloride', 'mercury chloride'],
   hydroquinone: ['hidrokuinon'],
+  tretinoin: ['retinoic acid', 'asam retinoat'],
+  clobetasol: ['clobetasol propionate'],
   lead: ['timbal', 'pb'],
   arsenic: ['arsen'],
   'rhodamine b': ['rhoda min b', 'rhoda mine b'],
+  alcohol: ['ethanol', 'ethyl alcohol', 'alcohol denat', 'denatured alcohol'],
+  'sodium benzoate': ['natrium benzoat'],
+  fragrance: ['parfum', 'perfume'],
+  phenoxyethanol: [],
+  'salicylic acid': ['asam salisilat', 'bha'],
+  'benzyl alcohol': [],
+  'benzoic acid': ['asam benzoat'],
+  'potassium sorbate': [],
+  'sorbic acid': [],
+  paraben: ['parabens', 'methylparaben', 'propylparaben', 'butylparaben'],
   water: ['aqua'],
 };
+
+const DEFINITELY_DANGEROUS_KEYS = new Set([
+  'mercury',
+  'hydroquinone',
+  'lead',
+  'arsenic',
+  'rhodamine b',
+  'tretinoin',
+  'clobetasol',
+]);
+
+const CONDITIONAL_CAUTION_KEYS = new Set([
+  'alcohol',
+  'sodium benzoate',
+  'fragrance',
+  'phenoxyethanol',
+  'salicylic acid',
+  'benzyl alcohol',
+  'benzoic acid',
+  'potassium sorbate',
+  'sorbic acid',
+  'paraben',
+]);
 
 const ALIAS_TO_CANONICAL = Object.entries(CANONICAL_ALIASES).reduce((acc, [canonical, aliases]) => {
   acc[canonical] = canonical;
@@ -189,11 +224,15 @@ function normalizeIngredient(item) {
     item?.safeToBuyReason ??
     item?.safe_to_buy_reason;
   const recommendationReason = String(recommendationReasonRaw || '').trim();
-  const defaultRecommendationReason =
-    'Tidak direkomendasikan untuk dibeli karena bahan ini sudah dikategorikan berisiko pada analisis.';
-  const recommendationReasonNormalized = /aman|direkomendasikan|layak/i.test(recommendationReason)
-    ? defaultRecommendationReason
-    : recommendationReason;
+  const recommendationSafeRaw =
+    item?.recommendation?.safe ??
+    item?.recommendationSafe ??
+    item?.recommendation_safe ??
+    item?.safeToBuy?.safe ??
+    item?.safe_to_buy?.safe ??
+    item?.safeToBuySafe ??
+    item?.safe_to_buy_safe;
+  const recommendationSafe = typeof recommendationSafeRaw === 'boolean' ? recommendationSafeRaw : null;
 
   return {
     name,
@@ -206,10 +245,115 @@ function normalizeIngredient(item) {
       reason: pregnancyReason || defaultPregnancyReason,
     },
     recommendation: {
-      safe: false,
-      reason: recommendationReasonNormalized || defaultRecommendationReason,
+      safe: recommendationSafe,
+      reason: recommendationReason,
     },
   };
+}
+
+function buildDetectedIngredientIndex(detectedIngredients) {
+  const indexMap = new Map();
+  detectedIngredients.forEach((item, index) => {
+    const key = canonicalKey(item);
+    if (key && !indexMap.has(key)) {
+      indexMap.set(key, index);
+    }
+  });
+  return indexMap;
+}
+
+function findIngredientIndex(item, detectedIndexMap) {
+  const candidates = [item.name, ...(Array.isArray(item.aliases) ? item.aliases : [])];
+  let best = Number.POSITIVE_INFINITY;
+  for (const candidate of candidates) {
+    const idx = detectedIndexMap.get(canonicalKey(candidate));
+    if (typeof idx === 'number' && idx < best) {
+      best = idx;
+    }
+  }
+  return Number.isFinite(best) ? best : -1;
+}
+
+function hasHighConcentrationHint(item, ingredientIndex) {
+  if (ingredientIndex !== -1 && ingredientIndex <= 2) {
+    return true;
+  }
+
+  const text = `${item.risk || ''} ${item.severityReason || ''}`.toLowerCase();
+  return /kadar tinggi|konsentrasi tinggi|high concentration|high amount|tinggi dalam komposisi/.test(text);
+}
+
+function computeRecommendation(item, ingredientIndex) {
+  const key = canonicalKey(item.name);
+  const definitelyDangerous = DEFINITELY_DANGEROUS_KEYS.has(key);
+  const conditional = CONDITIONAL_CAUTION_KEYS.has(key);
+  const highConcentrationLikely = hasHighConcentrationHint(item, ingredientIndex);
+
+  if (definitelyDangerous) {
+    return {
+      safe: false,
+      reason:
+        'Tidak direkomendasikan untuk dibeli karena bahan ini termasuk berisiko tinggi dan umum dibatasi/dilarang dalam penggunaan kosmetik.',
+    };
+  }
+
+  if (conditional) {
+    if (item.severity === 'high' && highConcentrationLikely) {
+      return {
+        safe: false,
+        reason:
+          'Tidak direkomendasikan untuk dibeli karena bahan ini bersifat kontekstual namun terindikasi berisiko tinggi pada kadar/paparan yang kemungkinan tinggi.',
+      };
+    }
+
+    return {
+      safe: true,
+      reason:
+        'Masih bisa dipertimbangkan untuk dibeli, namun gunakan dengan hati-hati karena risiko bahan ini bergantung pada kadar, frekuensi pemakaian, dan sensitivitas kulit.',
+    };
+  }
+
+  if (item.severity === 'high') {
+    return {
+      safe: false,
+      reason:
+        'Tidak direkomendasikan untuk dibeli karena tingkat risikonya tinggi berdasarkan profil toksisitas dan potensi dampak kesehatan.',
+    };
+  }
+
+  if (item.severity === 'medium') {
+    return {
+      safe: true,
+      reason:
+        'Masih bisa dipertimbangkan untuk dibeli, tetapi perlu kehati-hatian dalam pemakaian dan sebaiknya dilakukan uji cocok (patch test).',
+    };
+  }
+
+  return {
+    safe: true,
+    reason:
+      'Secara umum masih layak dibeli, namun tetap gunakan sesuai petunjuk dan hentikan pemakaian jika muncul iritasi.',
+  };
+}
+
+function normalizeRecommendationReason(aiReason, safeValue, fallbackReason) {
+  const reason = String(aiReason || '').trim();
+  if (!reason) {
+    return fallbackReason;
+  }
+
+  const positivePattern = /\baman\b|\bdirekomendasikan\b|\blayak\b/i;
+  const negativePattern = /\btidak disarankan\b|\bberisiko tinggi\b|\bjangan\b/i;
+
+  if (safeValue === false && positivePattern.test(reason) && !negativePattern.test(reason)) {
+    return fallbackReason;
+  }
+
+  if (safeValue === true && negativePattern.test(reason) && !positivePattern.test(reason)) {
+    return fallbackReason;
+  }
+
+  return reason;
 }
 
 function extractJsonChunk(rawText) {
@@ -352,7 +496,25 @@ function parseAIResponse(rawText, ingredientText = '') {
   }
 
   const normalizedRisky = rawIngredients.map(normalizeIngredient).filter(Boolean);
-  const riskyIngredients = mergeRiskyIngredients(normalizedRisky);
+  const riskyIngredientsMerged = mergeRiskyIngredients(normalizedRisky);
+  const detectedIndexMap = buildDetectedIngredientIndex(detectedIngredients);
+  const riskyIngredients = riskyIngredientsMerged.map((item) => {
+    const index = findIngredientIndex(item, detectedIndexMap);
+    const computedRecommendation = computeRecommendation(item, index);
+    const aiReason = String(item?.recommendation?.reason || '').trim();
+
+    return {
+      ...item,
+      recommendation: {
+        safe: computedRecommendation.safe,
+        reason: normalizeRecommendationReason(
+          aiReason,
+          computedRecommendation.safe,
+          computedRecommendation.reason
+        ),
+      },
+    };
+  });
   const riskyKeys = new Set();
 
   for (const risky of riskyIngredients) {
