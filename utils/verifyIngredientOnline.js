@@ -6,31 +6,37 @@ const MAX_ONLINE_LOOKUPS = 24;
 const LOOKUP_CONCURRENCY = 6;
 const DEFAULT_SAFETY_RECHECK_BUDGET = 4;
 
-const SEVERE_GHS_CODES = new Set([
+const HIGH_IMPACT_GHS_CODES = new Set([
   'H300',
   'H301',
   'H310',
   'H311',
-  'H314',
-  'H317',
-  'H318',
   'H330',
   'H331',
-  'H334',
   'H340',
-  'H341',
   'H350',
-  'H351',
   'H360',
+  'H370',
+  'H372',
+]);
+
+const CAUTION_GHS_CODES = new Set([
+  'H302',
+  'H312',
+  'H315',
+  'H317',
+  'H318',
+  'H319',
+  'H332',
+  'H334',
+  'H335',
+  'H336',
+  'H341',
+  'H351',
   'H361',
   'H362',
-  'H370',
   'H371',
-  'H372',
   'H373',
-  'H400',
-  'H410',
-  'H411',
 ]);
 
 const ALWAYS_RISKY_KEYS = new Set([
@@ -260,10 +266,14 @@ async function lookupPubChemCid(name) {
   }
 }
 
-async function lookupSevereGhsCodesByCid(cid) {
+async function lookupGhsCodesByCid(cid) {
   const cidNum = Number(cid);
   if (!Number.isFinite(cidNum) || cidNum <= 0) {
-    return [];
+    return {
+      all: [],
+      high: [],
+      caution: [],
+    };
   }
 
   const cacheKey = String(cidNum);
@@ -280,8 +290,9 @@ async function lookupSevereGhsCodesByCid(cid) {
     const res = await fetch(url, { signal: controller.signal });
 
     if (res.status === 404) {
-      setCachedValue(hazardCache, cacheKey, []);
-      return [];
+      const empty = { all: [], high: [], caution: [] };
+      setCachedValue(hazardCache, cacheKey, empty);
+      return empty;
     }
 
     if (!res.ok) {
@@ -290,9 +301,15 @@ async function lookupSevereGhsCodesByCid(cid) {
 
     const text = await res.text();
     const allCodes = Array.from(new Set(text.match(/\bH\d{3}\b/g) || []));
-    const severeCodes = allCodes.filter((code) => SEVERE_GHS_CODES.has(code));
-    setCachedValue(hazardCache, cacheKey, severeCodes);
-    return severeCodes;
+    const highCodes = allCodes.filter((code) => HIGH_IMPACT_GHS_CODES.has(code));
+    const cautionCodes = allCodes.filter((code) => CAUTION_GHS_CODES.has(code));
+    const value = {
+      all: allCodes,
+      high: highCodes,
+      caution: cautionCodes,
+    };
+    setCachedValue(hazardCache, cacheKey, value);
+    return value;
   } catch (error) {
     return null;
   } finally {
@@ -356,20 +373,32 @@ async function doubleCheckIngredientSafetyOnline(name, aliases = [], options = {
       continue;
     }
 
-    const severeCodes = await lookupSevereGhsCodesByCid(cid);
-    if (severeCodes === null) {
+    const ghs = await lookupGhsCodesByCid(cid);
+    if (ghs === null) {
       continue;
     }
 
-    if (severeCodes.length > 0) {
+    if (Array.isArray(ghs.high) && ghs.high.length > 0) {
       return {
         status: 'risky',
         source: 'pubchem',
         cid,
-        reason: `Terindikasi kode bahaya GHS pada referensi PubChem (${severeCodes.join(
+        reason: `Terindikasi kode bahaya GHS berdampak tinggi pada referensi PubChem (${ghs.high.join(
           ', '
         )}).`,
-        codes: severeCodes,
+        codes: ghs.high,
+      };
+    }
+
+    if (Array.isArray(ghs.caution) && ghs.caution.length > 0) {
+      return {
+        status: 'caution',
+        source: 'pubchem',
+        cid,
+        reason: `Ada kode GHS level kehati-hatian pada referensi PubChem (${ghs.caution.join(
+          ', '
+        )}). Bahan ini tidak otomatis berbahaya, penilaian tetap bergantung kadar/formulasi.`,
+        codes: ghs.caution,
       };
     }
 

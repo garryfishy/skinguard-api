@@ -45,6 +45,34 @@ const HIGH_IMPACT_CODES = new Set([
   'H410',
 ]);
 
+const ALWAYS_UNSAFE_KEYS = new Set([
+  'mercury',
+  'hydroquinone',
+  'lead',
+  'arsenic',
+  'rhodamine b',
+  'tretinoin',
+  'clobetasol',
+]);
+
+const CONTEXTUAL_CAUTION_KEYS = new Set([
+  'alcohol',
+  'sodium benzoate',
+  'fragrance',
+  'phenoxyethanol',
+  'salicylic acid',
+  'benzyl alcohol',
+  'benzoic acid',
+  'potassium sorbate',
+  'sorbic acid',
+  'paraben',
+  'propylene glycol',
+  'butylene glycol',
+  'caprylic',
+  'caprylyl glycol',
+  'sodium lactate',
+]);
+
 function normalizeKey(value) {
   return String(value || '')
     .toLowerCase()
@@ -56,6 +84,14 @@ function normalizeKey(value) {
 function canonicalKey(value) {
   const key = normalizeKey(value);
   return ALIAS_TO_CANONICAL[key] || key;
+}
+
+function isAlwaysUnsafeIngredient(value) {
+  return ALWAYS_UNSAFE_KEYS.has(canonicalKey(value));
+}
+
+function isContextualCautionIngredient(value) {
+  return CONTEXTUAL_CAUTION_KEYS.has(canonicalKey(value));
 }
 
 function ensureStoreLoaded() {
@@ -198,8 +234,26 @@ function hasHighImpactCodes(codes = []) {
   return Array.isArray(codes) && codes.some((code) => HIGH_IMPACT_CODES.has(String(code || '')));
 }
 
-function buildRiskItemFromOnlineCheck(name, check) {
+function isHardUnsafeByCheck(name, check) {
+  if (isAlwaysUnsafeIngredient(name)) {
+    return true;
+  }
+
   const highImpact = hasHighImpactCodes(check?.codes);
+  if (!highImpact) {
+    return false;
+  }
+
+  if (isContextualCautionIngredient(name)) {
+    return false;
+  }
+
+  return true;
+}
+
+function buildRiskItemFromOnlineCheck(name, check) {
+  const hardUnsafe = isHardUnsafeByCheck(name, check);
+
   return {
     name: toDisplayName(name, 'Unknown ingredient'),
     aliases: [],
@@ -207,20 +261,21 @@ function buildRiskItemFromOnlineCheck(name, check) {
       check?.reason ||
         'Bahan ini memiliki indikator bahaya dari referensi online sehingga perlu kehati-hatian tinggi.'
     ),
-    severity: highImpact ? 'high' : 'medium',
-    severityReason: highImpact
+    severity: hardUnsafe ? 'high' : 'medium',
+    severityReason: hardUnsafe
       ? 'Terdapat kode bahaya GHS berdampak tinggi pada referensi online.'
-      : 'Terdapat indikator bahaya GHS pada referensi online sehingga risikonya minimal kategori sedang.',
+      : 'Terdapat indikator kehati-hatian pada referensi online sehingga risikonya kontekstual (bergantung kadar/formulasi).',
     pregnancy: {
       safe: false,
-      reason: highImpact
+      reason: hardUnsafe
         ? 'Tidak disarankan saat hamil karena ada indikasi toksisitas tinggi.'
-        : 'Perlu konsultasi medis saat hamil karena ada indikator bahaya kimia.',
+        : 'Perlu kehati-hatian saat hamil; konsultasikan penggunaan terutama bila kulit sensitif atau ada riwayat iritasi.',
     },
     recommendation: {
-      safe: false,
-      reason:
-        'Tidak direkomendasikan sebelum ada konfirmasi kadar/formulasi dan evaluasi profesional.',
+      safe: !hardUnsafe,
+      reason: hardUnsafe
+        ? 'Tidak direkomendasikan sebelum ada konfirmasi kadar/formulasi dan evaluasi profesional.'
+        : 'Masih bisa dipertimbangkan untuk dibeli, namun gunakan dengan hati-hati karena efeknya bergantung pada kadar dan toleransi kulit.',
     },
   };
 }
@@ -230,11 +285,17 @@ function strengthenRiskItemWithOnlineCheck(item, check) {
     return buildRiskItemFromOnlineCheck(item?.name || 'Unknown ingredient', check);
   }
 
-  const highImpact = hasHighImpactCodes(check?.codes);
-  const severity = highImpact ? 'high' : item.severity === 'high' ? 'high' : 'medium';
-  const severityReason = highImpact
-    ? 'Verifikasi internet menemukan kode bahaya GHS berdampak tinggi.'
-    : item.severityReason || 'Verifikasi internet menemukan indikator bahaya pada bahan ini.';
+  const hardUnsafe = isHardUnsafeByCheck(item.name, check);
+  const keepHigh = item.severity === 'high' && hardUnsafe;
+  const severity = hardUnsafe || keepHigh ? 'high' : 'medium';
+  const severityReason = hardUnsafe
+    ? 'Verifikasi internet menemukan indikator bahaya berdampak tinggi.'
+    : item.severityReason ||
+      'Verifikasi internet menunjukkan level kehati-hatian, sehingga penilaian bergantung kadar/formulasi.';
+  const recommendationSafe = hardUnsafe ? false : true;
+  const recommendationReason = hardUnsafe
+    ? 'Tidak direkomendasikan sampai ada bukti kadar/formulasi yang jelas dan evaluasi lebih lanjut.'
+    : 'Masih direkomendasikan dengan catatan: gunakan bertahap, perhatikan reaksi kulit, dan hindari pemakaian berlebihan.';
 
   return {
     ...item,
@@ -243,14 +304,13 @@ function strengthenRiskItemWithOnlineCheck(item, check) {
     risk: String(check?.reason || item.risk || 'No description available'),
     pregnancy: {
       safe: false,
-      reason: highImpact
+      reason: hardUnsafe
         ? 'Tidak aman untuk kehamilan karena indikator bahaya tinggi.'
-        : 'Perlu kehati-hatian saat hamil; ada indikator bahaya dari referensi online.',
+        : 'Perlu kehati-hatian saat hamil; gunakan seperlunya dan konsultasikan bila perlu.',
     },
     recommendation: {
-      safe: false,
-      reason:
-        'Tidak direkomendasikan sampai ada bukti kadar/formulasi yang jelas dan evaluasi lebih lanjut.',
+      safe: recommendationSafe,
+      reason: recommendationReason,
     },
   };
 }
@@ -310,6 +370,7 @@ async function stabilizeWithIngredientMemory(data, options = {}) {
   const keysToRecheck = new Set();
   const internetCheckByKey = new Map();
   let escalatedByInternetCount = 0;
+  let softenedByInternetCount = 0;
 
   for (const item of riskyInput) {
     if (!item || typeof item !== 'object') {
@@ -408,13 +469,51 @@ async function stabilizeWithIngredientMemory(data, options = {}) {
       };
       internetCheckByKey.set(result.key, normalizedCheck);
 
+      const existingRisk = riskyMap.get(result.key);
+
+      if (normalizedCheck.status === 'safe') {
+        if (existingRisk && !isAlwaysUnsafeIngredient(existingRisk.name || result.displayName)) {
+          riskyMap.delete(result.key);
+          safeMap.set(result.key, toDisplayName(existingRisk.name, result.displayName));
+          softenedByInternetCount += 1;
+        }
+        continue;
+      }
+
+      if (normalizedCheck.status === 'caution') {
+        if (existingRisk) {
+          riskyMap.set(result.key, strengthenRiskItemWithOnlineCheck(existingRisk, normalizedCheck));
+          softenedByInternetCount += 1;
+        } else if (isContextualCautionIngredient(result.displayName) && !safeMap.has(result.key)) {
+          riskyMap.set(result.key, buildRiskItemFromOnlineCheck(result.displayName, normalizedCheck));
+        }
+        continue;
+      }
+
       if (normalizedCheck.status !== 'risky') {
+        continue;
+      }
+
+      const isContextualHighCode =
+        isContextualCautionIngredient(result.displayName) &&
+        !isAlwaysUnsafeIngredient(result.displayName);
+      if (isContextualHighCode) {
+        const existingContextualRisk = riskyMap.get(result.key);
+        const softenedCheck = {
+          ...normalizedCheck,
+          status: 'caution',
+          reason:
+            'Terdapat indikator hazard pada data referensi bahan murni, namun untuk kosmetik penilaian tetap kontekstual (kadar, formulasi, dan cara pakai).',
+        };
+        if (existingContextualRisk) {
+          riskyMap.set(result.key, strengthenRiskItemWithOnlineCheck(existingContextualRisk, softenedCheck));
+          softenedByInternetCount += 1;
+        }
         continue;
       }
 
       const wasSafe = safeMap.has(result.key);
       safeMap.delete(result.key);
-      const existingRisk = riskyMap.get(result.key);
       if (existingRisk) {
         riskyMap.set(result.key, strengthenRiskItemWithOnlineCheck(existingRisk, normalizedCheck));
       } else {
@@ -473,7 +572,14 @@ async function stabilizeWithIngredientMemory(data, options = {}) {
     }
 
     const prev = store.items[key];
-    if (prev && prev.verdict === 'risky') {
+    const latestCheckStatus = internetCheckByKey.get(key)?.status || prev?.internetCheck?.status || '';
+    const canDowngradeRiskyToSafe =
+      prev &&
+      prev.verdict === 'risky' &&
+      latestCheckStatus === 'safe' &&
+      !isAlwaysUnsafeIngredient(name);
+
+    if (prev && prev.verdict === 'risky' && !canDowngradeRiskyToSafe) {
       continue;
     }
 
@@ -496,11 +602,20 @@ async function stabilizeWithIngredientMemory(data, options = {}) {
   const safeCount = safeIngredients.length;
   const summary = `${riskyIngredients.length} of ${totalDetected} detected ingredients are flagged as risky.`;
 
-  const finalWarning = mergeWarnings(
-    data.warning,
+  const baseWarning = String(data.warning || '').trim();
+  const escalateMessage =
     escalatedByInternetCount > 0
       ? `${escalatedByInternetCount} bahan dipastikan berisiko melalui verifikasi internet tambahan.`
-      : ''
+      : '';
+  const softenMessage =
+    softenedByInternetCount > 0
+      ? `${softenedByInternetCount} bahan dilonggarkan ke status kehati-hatian/aman berdasarkan verifikasi internet terbaru.`
+      : '';
+
+  const finalWarning = mergeWarnings(
+    baseWarning,
+    escalateMessage && !baseWarning.includes(escalateMessage) ? escalateMessage : '',
+    softenMessage && !baseWarning.includes(softenMessage) ? softenMessage : ''
   );
 
   const result = {
