@@ -242,6 +242,31 @@ function joinNaturalLanguage(items = []) {
   return `${head}, dan ${values[values.length - 1]}`;
 }
 
+function isDangerousRiskItem(item) {
+  if (!item || typeof item !== 'object') {
+    return false;
+  }
+
+  const classification = String(item?.classification || '').toUpperCase();
+  if (classification === INGREDIENT_CLASSIFICATIONS.DANGEROUS) {
+    return true;
+  }
+
+  const severity = String(item?.severity || '').toLowerCase();
+  return severity === 'high';
+}
+
+function getRiskItemCounts(data) {
+  const riskyIngredients = Array.isArray(data?.riskyIngredients) ? data.riskyIngredients : [];
+  const dangerousCount = riskyIngredients.filter((item) => isDangerousRiskItem(item)).length;
+  const cautionCount = Math.max(0, riskyIngredients.length - dangerousCount);
+  return {
+    riskyCount: riskyIngredients.length,
+    dangerousCount,
+    cautionCount,
+  };
+}
+
 const PREGNANCY_EFFECT_RULES = [
   {
     pattern: /\b(mercury|merkuri|raksa)\b/i,
@@ -301,6 +326,7 @@ function buildRiskNarrative(data) {
     return 'Berdasarkan bahan yang terdeteksi, tidak ada indikasi utama bahan berisiko tinggi pada komposisi produk ini.';
   }
 
+  const counts = getRiskItemCounts(data);
   const names = riskyIngredients
     .map((item) => String(item?.name || '').trim())
     .filter(Boolean)
@@ -318,20 +344,21 @@ function buildRiskNarrative(data) {
       ? reasons.join('. ')
       : 'bahan-bahan tersebut memiliki profil risiko yang perlu diwaspadai';
 
-  const hasHighDanger = riskyIngredients.some(
-    (item) =>
-      String(item?.classification || '').toUpperCase() === INGREDIENT_CLASSIFICATIONS.DANGEROUS ||
-      String(item?.severity || '').toLowerCase() === 'high'
-  );
-  const closing = hasHighDanger
-    ? 'Karena itu, produk ini termasuk kurang direkomendasikan tanpa pertimbangan medis.'
-    : 'Produk masih bisa dipertimbangkan dengan pemakaian hati-hati dan uji cocok terlebih dahulu.';
+  const closing =
+    counts.dangerousCount > 0
+      ? `Terdapat ${counts.dangerousCount} bahan dengan tingkat bahaya tinggi, sehingga produk ini kurang direkomendasikan tanpa pertimbangan medis.`
+      : `Tidak ditemukan bahan berbahaya tingkat tinggi, tetapi ada ${counts.cautionCount} bahan yang tetap perlu kehati-hatian penggunaan.`;
 
   return `Adanya bahan ${nameText} membuat produk ini perlu diwaspadai karena ${reasonText}. ${closing}`;
 }
 
 function buildPregnancySummary(data) {
   const riskyIngredients = Array.isArray(data?.riskyIngredients) ? data.riskyIngredients : [];
+  const riskyNames = riskyIngredients
+    .map((item) => String(item?.name || '').trim())
+    .filter(Boolean)
+    .slice(0, 5);
+  const riskyText = joinNaturalLanguage(riskyNames);
   const pregnancyRiskItems = riskyIngredients.filter((item) => {
     if (item?.pregnancy && item.pregnancy.safe === false) {
       return true;
@@ -346,10 +373,12 @@ function buildPregnancySummary(data) {
   });
 
   if (pregnancyRiskItems.length === 0) {
+    const hasRiskyIngredients = riskyIngredients.length > 0;
     return {
       safe: true,
-      reason:
-        'Berdasarkan komposisi yang terdeteksi, tidak ditemukan sinyal utama bahan berisiko tinggi untuk kehamilan. Tetap gunakan sesuai aturan dan hentikan pemakaian bila muncul iritasi.',
+      reason: hasRiskyIngredients
+        ? `Walaupun ada bahan yang perlu kehati-hatian (${riskyText}), tidak ditemukan sinyal kuat risiko spesifik kehamilan pada konteks skincare kadar kosmetik normal. Ini bukan berarti tanpa risiko umum, jadi tetap gunakan sesuai aturan, lakukan patch test, dan hentikan pemakaian bila muncul iritasi.`
+        : 'Berdasarkan komposisi yang terdeteksi, tidak ditemukan sinyal utama bahan berisiko tinggi untuk kehamilan. Tetap gunakan sesuai aturan dan hentikan pemakaian bila muncul iritasi.',
       affectedIngredients: [],
     };
   }
@@ -376,15 +405,40 @@ function buildPregnancySummary(data) {
   };
 }
 
+function buildFallbackOverallRecommendation(data) {
+  const counts = getRiskItemCounts(data);
+  if (counts.riskyCount === 0) {
+    return {
+      safe: true,
+      reason:
+        'Tidak ada bahan berisiko yang terdeteksi pada komposisi, sehingga produk dinilai aman dipakai sesuai aturan pakai.',
+    };
+  }
+
+  if (counts.dangerousCount > 0) {
+    return {
+      safe: false,
+      reason: `Ditemukan ${counts.dangerousCount} bahan berbahaya tingkat tinggi pada komposisi. Produk tidak disarankan tanpa evaluasi lebih lanjut.`,
+    };
+  }
+
+  return {
+    safe: true,
+    reason: `Ditemukan ${counts.cautionCount} bahan yang perlu kehati-hatian, namun tidak terindikasi bahan berbahaya tingkat tinggi. Produk masih bisa dipertimbangkan dengan pemakaian sesuai aturan.`,
+  };
+}
+
 function attachNarrativeSummaries(data) {
   if (!data || typeof data !== 'object') {
     return data;
   }
 
+  const fallbackOverallRecommendation = buildFallbackOverallRecommendation(data);
   return {
     ...data,
     riskNarrative: buildRiskNarrative(data),
     pregnancy: buildPregnancySummary(data),
+    overallRecommendation: data?.overallRecommendation || fallbackOverallRecommendation,
   };
 }
 
@@ -396,6 +450,7 @@ function buildSkincareAssessmentReason({
   strictDangerNames,
   avgThreshold,
   highThreshold,
+  riskyCount = 0,
 }) {
   const roundedAvg = Number(averageScore.toFixed(2));
   const roundedMax = Number(maxScore.toFixed(2));
@@ -413,7 +468,7 @@ function buildSkincareAssessmentReason({
     return `Produk tidak disarankan karena rata-rata skor risiko bahan bermasalah mencapai ${roundedAvg}/10 dalam konteks skincare.`;
   }
 
-  return `Walaupun ada bahan yang perlu diperhatikan, rata-rata skor risiko dalam konteks skincare adalah ${roundedAvg}/10 (maksimum ${roundedMax}/10), sehingga produk masih tergolong aman dipakai sesuai aturan pakai.`;
+  return `Terdapat ${riskyCount} bahan yang perlu diperhatikan, namun tidak ada yang melewati ambang bahaya utama. Rata-rata skor risiko konteks skincare adalah ${roundedAvg}/10 (maksimum ${roundedMax}/10), sehingga produk masih dapat dipakai dengan kehati-hatian sesuai aturan pakai.`;
 }
 
 async function applySkincareContextAIGating(data, ingredientText = '') {
@@ -534,6 +589,7 @@ async function applySkincareContextAIGating(data, ingredientText = '') {
     strictDangerNames,
     avgThreshold,
     highThreshold,
+    riskyCount: riskyWithScores.length,
   });
 
   const existingNarrative = String(data.riskNarrative || '').trim();

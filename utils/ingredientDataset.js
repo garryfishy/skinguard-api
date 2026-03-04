@@ -1,15 +1,21 @@
 const fs = require('fs');
 const path = require('path');
 
-const DATASET_CANDIDATE_PATHS = [
-  process.env.INGREDIENT_DATASET_PATH
-    ? path.resolve(process.cwd(), process.env.INGREDIENT_DATASET_PATH)
-    : '',
-  path.join(__dirname, '..', 'skinguard_ingredients_dataset_12000.csv'),
+const DEFAULT_PRIMARY_DATASET_PATH = path.join(
+  __dirname,
+  '..',
+  'skinguard_ingredients_dataset_12000.csv'
+);
+const DEFAULT_FALLBACK_DATASET_PATH = path.join(
+  __dirname,
+  '..',
+  'skinguard_ingredients_dataset_online_all_az.csv'
+);
+const LEGACY_DATASET_PATHS = [
   path.join(__dirname, '..', 'skinguard_ingredients_dataset_8000.csv'),
   path.join(__dirname, '..', 'cosmetic_ingredients_dataset_8000_en_id.csv'),
   path.join(__dirname, '..', 'cosmetic_ingredients_dataset_5000_en_id.csv'),
-].filter(Boolean);
+];
 
 const INGREDIENT_CLASSIFICATIONS = Object.freeze({
   SAFE: 'SAFE',
@@ -61,7 +67,8 @@ let hasFile = false;
 let loadError = null;
 let totalRows = 0;
 let dangerousRows = 0;
-let resolvedDatasetPath = '';
+let resolvedDatasetPaths = [];
+let loadedDatasetSources = [];
 
 const keyToEntry = new Map();
 const compactKeyToEntry = new Map();
@@ -144,19 +151,119 @@ function parseCsvLine(line) {
   return output.map((value) => String(value || '').trim());
 }
 
+function resolveCandidatePath(value) {
+  const text = String(value || '').trim();
+  if (!text) {
+    return '';
+  }
+
+  return path.resolve(process.cwd(), text);
+}
+
+function resolveDatasetSources() {
+  const primaryFromEnv = resolveCandidatePath(
+    process.env.INGREDIENT_DATASET_PRIMARY_PATH || process.env.INGREDIENT_DATASET_PATH
+  );
+  const fallbackFromEnv = resolveCandidatePath(process.env.INGREDIENT_DATASET_FALLBACK_PATH);
+  const extraFromEnv = String(process.env.INGREDIENT_DATASET_EXTRA_PATHS || '')
+    .split(',')
+    .map((item) => resolveCandidatePath(item))
+    .filter(Boolean);
+
+  const candidates = [
+    {
+      label: 'primary',
+      path: primaryFromEnv || DEFAULT_PRIMARY_DATASET_PATH,
+      rank: 0,
+      allowFuzzy: true,
+    },
+    {
+      label: 'fallback_online',
+      path: fallbackFromEnv || DEFAULT_FALLBACK_DATASET_PATH,
+      rank: 1,
+      allowFuzzy: false,
+    },
+    ...extraFromEnv.map((filePath, index) => ({
+      label: `extra_${index + 1}`,
+      path: filePath,
+      rank: 2 + index,
+      allowFuzzy: false,
+    })),
+    ...LEGACY_DATASET_PATHS.map((filePath, index) => ({
+      label: `legacy_${index + 1}`,
+      path: filePath,
+      rank: 20 + index,
+      allowFuzzy: false,
+    })),
+  ];
+
+  const unique = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const resolvedPath = resolveCandidatePath(candidate.path) || candidate.path;
+    if (!resolvedPath || seen.has(resolvedPath)) {
+      continue;
+    }
+
+    seen.add(resolvedPath);
+    unique.push({
+      ...candidate,
+      path: resolvedPath,
+    });
+  }
+
+  return unique;
+}
+
 function mergeEntry(base, incoming) {
   if (!base) {
     return {
       englishName: incoming.englishName,
       indonesianName: incoming.indonesianName,
       isDangerous: Boolean(incoming.isDangerous),
+      sourceRank: Number.isFinite(incoming.sourceRank) ? incoming.sourceRank : 999,
+      allowFuzzy: incoming.allowFuzzy !== false,
+      sourceLabels: Array.isArray(incoming.sourceLabels)
+        ? Array.from(new Set(incoming.sourceLabels.map((value) => String(value || '').trim()).filter(Boolean)))
+        : [],
+      dangerousSources: Array.isArray(incoming.dangerousSources)
+        ? Array.from(
+            new Set(incoming.dangerousSources.map((value) => String(value || '').trim()).filter(Boolean))
+          )
+        : [],
     };
   }
 
+  const baseRank = Number.isFinite(base.sourceRank) ? base.sourceRank : 999;
+  const incomingRank = Number.isFinite(incoming.sourceRank) ? incoming.sourceRank : 999;
+  const incomingPreferred = incomingRank < baseRank;
+
+  const sourceLabels = Array.from(
+    new Set([
+      ...(Array.isArray(base.sourceLabels) ? base.sourceLabels : []),
+      ...(Array.isArray(incoming.sourceLabels) ? incoming.sourceLabels : []),
+    ])
+  );
+
+  const dangerousSources = Array.from(
+    new Set([
+      ...(Array.isArray(base.dangerousSources) ? base.dangerousSources : []),
+      ...(Array.isArray(incoming.dangerousSources) ? incoming.dangerousSources : []),
+    ])
+  );
+
   return {
-    englishName: base.englishName || incoming.englishName,
-    indonesianName: base.indonesianName || incoming.indonesianName,
+    englishName: incomingPreferred
+      ? incoming.englishName || base.englishName
+      : base.englishName || incoming.englishName,
+    indonesianName: incomingPreferred
+      ? incoming.indonesianName || base.indonesianName
+      : base.indonesianName || incoming.indonesianName,
     isDangerous: Boolean(base.isDangerous || incoming.isDangerous),
+    sourceRank: Math.min(baseRank, incomingRank),
+    allowFuzzy: Boolean(base.allowFuzzy || incoming.allowFuzzy),
+    sourceLabels,
+    dangerousSources,
   };
 }
 
@@ -179,22 +286,16 @@ function addEntryKey(name, entry) {
   compactKeyToEntry.set(compactKey, mergeEntry(existingByCompact, merged));
 }
 
-function resolveDatasetPath() {
-  for (const candidate of DATASET_CANDIDATE_PATHS) {
-    if (candidate && fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-
-  return DATASET_CANDIDATE_PATHS[0] || '';
-}
-
 function buildDangerousOverrideEntry(canonical, aliases = []) {
   const firstAlias = Array.isArray(aliases) ? aliases.find((alias) => String(alias || '').trim()) : '';
   return {
     englishName: canonical,
     indonesianName: String(firstAlias || '').trim(),
     isDangerous: true,
+    sourceRank: 0,
+    allowFuzzy: true,
+    sourceLabels: ['dangerous_override'],
+    dangerousSources: ['dangerous_override'],
   };
 }
 
@@ -214,6 +315,17 @@ function applyDangerousAliasOverrides() {
 
     const merged = mergeEntry(existing, buildDangerousOverrideEntry(canonical, aliases));
     merged.isDangerous = true;
+    merged.sourceRank = 0;
+    merged.allowFuzzy = true;
+    merged.sourceLabels = Array.from(
+      new Set([...(Array.isArray(merged.sourceLabels) ? merged.sourceLabels : []), 'dangerous_override'])
+    );
+    merged.dangerousSources = Array.from(
+      new Set([
+        ...(Array.isArray(merged.dangerousSources) ? merged.dangerousSources : []),
+        'dangerous_override',
+      ])
+    );
 
     addEntryKey(canonical, merged);
     for (const alias of aliases) {
@@ -228,6 +340,10 @@ function rebuildFuzzyRecords() {
   classificationCache.clear();
 
   for (const [key, entry] of keyToEntry.entries()) {
+    if (entry && entry.allowFuzzy === false) {
+      continue;
+    }
+
     const compact = normalizeIngredientCompactKey(key);
     if (!compact) {
       continue;
@@ -252,81 +368,110 @@ function loadIngredientDataset() {
   loadError = null;
   totalRows = 0;
   dangerousRows = 0;
-  resolvedDatasetPath = resolveDatasetPath();
+  resolvedDatasetPaths = [];
+  loadedDatasetSources = [];
   keyToEntry.clear();
   compactKeyToEntry.clear();
   fuzzyRecords.length = 0;
   fuzzySearchCache.clear();
   classificationCache.clear();
 
-  try {
-    if (!resolvedDatasetPath || !fs.existsSync(resolvedDatasetPath)) {
-      applyDangerousAliasOverrides();
-      rebuildFuzzyRecords();
-      return;
+  const sources = resolveDatasetSources();
+  const sourceErrors = [];
+
+  for (const source of sources) {
+    const sourcePath = String(source?.path || '');
+    if (!sourcePath) {
+      continue;
     }
 
-    hasFile = true;
-    const raw = fs.readFileSync(resolvedDatasetPath, 'utf8');
-    const lines = raw
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean);
-
-    if (lines.length <= 1) {
-      applyDangerousAliasOverrides();
-      rebuildFuzzyRecords();
-      return;
+    if (!fs.existsSync(sourcePath)) {
+      continue;
     }
 
-    const header = parseCsvLine(lines[0]).map((value) => value.toLowerCase());
-    const englishIdx = header.indexOf('english_name');
-    const indonesianIdx = header.indexOf('indonesian_name');
-    const dangerousIdx = header.indexOf('is_dangerous');
+    resolvedDatasetPaths.push(sourcePath);
 
-    if (englishIdx === -1 || indonesianIdx === -1 || dangerousIdx === -1) {
-      loadError = 'Invalid dataset header';
-      applyDangerousAliasOverrides();
-      rebuildFuzzyRecords();
-      return;
-    }
+    try {
+      const raw = fs.readFileSync(sourcePath, 'utf8');
+      const lines = raw
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
 
-    for (let i = 1; i < lines.length; i += 1) {
-      const cols = parseCsvLine(lines[i]);
-      if (!Array.isArray(cols) || cols.length === 0) {
+      if (lines.length <= 1) {
         continue;
       }
 
-      const englishName = String(cols[englishIdx] || '').trim();
-      const indonesianName = String(cols[indonesianIdx] || '').trim();
-      const isDangerous = parseBoolean(cols[dangerousIdx]);
+      const header = parseCsvLine(lines[0]).map((value) => value.toLowerCase());
+      const englishIdx = header.indexOf('english_name');
+      const indonesianIdx = header.indexOf('indonesian_name');
+      const dangerousIdx = header.indexOf('is_dangerous');
 
-      if (!englishName && !indonesianName) {
+      if (englishIdx === -1 || indonesianIdx === -1 || dangerousIdx === -1) {
+        sourceErrors.push(`${source.label}: invalid dataset header`);
         continue;
       }
 
-      totalRows += 1;
-      if (isDangerous) {
-        dangerousRows += 1;
+      let sourceRowCount = 0;
+      let sourceDangerousCount = 0;
+
+      for (let i = 1; i < lines.length; i += 1) {
+        const cols = parseCsvLine(lines[i]);
+        if (!Array.isArray(cols) || cols.length === 0) {
+          continue;
+        }
+
+        const englishName = String(cols[englishIdx] || '').trim();
+        const indonesianName = String(cols[indonesianIdx] || '').trim();
+        const isDangerous = parseBoolean(cols[dangerousIdx]);
+
+        if (!englishName && !indonesianName) {
+          continue;
+        }
+
+        sourceRowCount += 1;
+        totalRows += 1;
+        if (isDangerous) {
+          sourceDangerousCount += 1;
+          dangerousRows += 1;
+        }
+
+        const entry = {
+          englishName,
+          indonesianName,
+          isDangerous,
+          sourceRank: Number(source.rank || 0),
+          allowFuzzy: source.allowFuzzy !== false,
+          sourceLabels: [String(source.label || 'dataset')],
+          dangerousSources: isDangerous ? [String(source.label || 'dataset')] : [],
+        };
+
+        addEntryKey(englishName, entry);
+        addEntryKey(indonesianName, entry);
       }
 
-      const entry = {
-        englishName,
-        indonesianName,
-        isDangerous,
-      };
-
-      addEntryKey(englishName, entry);
-      addEntryKey(indonesianName, entry);
+      if (sourceRowCount > 0) {
+        hasFile = true;
+        loadedDatasetSources.push({
+          label: String(source.label || 'dataset'),
+          path: sourcePath,
+          rank: Number(source.rank || 0),
+          allowFuzzy: source.allowFuzzy !== false,
+          rows: sourceRowCount,
+          dangerousRows: sourceDangerousCount,
+        });
+      }
+    } catch (error) {
+      sourceErrors.push(`${source.label}: ${String(error?.message || error)}`);
     }
-
-    applyDangerousAliasOverrides();
-    rebuildFuzzyRecords();
-  } catch (error) {
-    loadError = String(error?.message || error);
-    applyDangerousAliasOverrides();
-    rebuildFuzzyRecords();
   }
+
+  if (!hasFile && sourceErrors.length > 0) {
+    loadError = sourceErrors.join(' | ');
+  }
+
+  applyDangerousAliasOverrides();
+  rebuildFuzzyRecords();
 }
 
 function lookupIngredientInDataset(name) {
@@ -386,6 +531,37 @@ function getDatasetAliases(name) {
 
 function toCanonicalEntryName(entry) {
   return String(entry?.englishName || entry?.indonesianName || '').trim();
+}
+
+function resolveEntrySourceLabel(entry, options = {}) {
+  const fuzzy = options.fuzzy === true;
+  const labels = Array.isArray(entry?.sourceLabels)
+    ? entry.sourceLabels.map((value) => String(value || '').trim()).filter(Boolean)
+    : [];
+
+  const hasPrimary = labels.includes('primary') || labels.includes('dangerous_override');
+  const hasFallback = labels.includes('fallback_online');
+
+  if (fuzzy) {
+    if (hasPrimary) {
+      return 'dataset_fuzzy_primary';
+    }
+    if (hasFallback) {
+      return 'dataset_fuzzy_secondary';
+    }
+    return 'dataset_fuzzy';
+  }
+
+  if (hasPrimary && hasFallback) {
+    return 'dataset_hybrid';
+  }
+  if (hasPrimary) {
+    return 'dataset_primary';
+  }
+  if (hasFallback) {
+    return 'dataset_secondary';
+  }
+  return 'dataset';
 }
 
 function getDatasetCanonicalKey(name) {
@@ -742,7 +918,7 @@ function classifyIngredientName(name, options = {}) {
       isDangerous: Boolean(exactEntry.isDangerous),
       confidence: 1,
       matchType: 'exact',
-      source: 'dataset',
+      source: resolveEntrySourceLabel(exactEntry),
       canonicalName: toCanonicalEntryName(exactEntry),
       matchedName: toCanonicalEntryName(exactEntry),
       matchedKey: normalizeIngredientKey(toCanonicalEntryName(exactEntry)),
@@ -829,7 +1005,7 @@ function classifyIngredientName(name, options = {}) {
       isDangerous,
       confidence: Number(fuzzy.score || 0),
       matchType: 'fuzzy',
-      source: 'dataset_fuzzy',
+      source: resolveEntrySourceLabel(fuzzy.entry, { fuzzy: true }),
       canonicalName: toCanonicalEntryName(fuzzy.entry),
       matchedName: toCanonicalEntryName(fuzzy.entry),
       matchedKey: fuzzy.matchedKey,
@@ -853,7 +1029,9 @@ function classifyIngredientName(name, options = {}) {
 function getIngredientDatasetInfo() {
   loadIngredientDataset();
   return {
-    path: resolvedDatasetPath,
+    path: resolvedDatasetPaths[0] || '',
+    paths: resolvedDatasetPaths,
+    sources: loadedDatasetSources,
     hasFile,
     loaded: isLoaded,
     loadError,

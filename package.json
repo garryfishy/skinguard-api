@@ -5,7 +5,8 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node index.js",
-    "eval:consistency": "node scripts/evaluateConsistency.js"
+    "eval:consistency": "node scripts/evaluateConsistency.js",
+    "dataset:build-online": "node scripts/buildOnlineIngredientDataset.js"
   },
   "keywords": [],
   "author": "",
