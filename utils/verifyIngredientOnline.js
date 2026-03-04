@@ -221,7 +221,7 @@ async function verifyIngredientCandidates(candidates, budget) {
   }
 
   if (hasUnknown) {
-    return false;
+    return isLikelyIngredient(candidates[0]);
   }
 
   return false;
@@ -303,23 +303,11 @@ async function verifyParsedIngredientsOnline(parsedData) {
   const verifiedRisky = riskyChecks.filter(Boolean);
   const riskyKeys = new Set(verifiedRisky.map((item) => normalizeKey(item.name)));
 
-  const safeChecks = await mapWithConcurrency(safeInput, LOOKUP_CONCURRENCY, async (name) => {
-    const candidates = buildCandidateList(name, []);
-    const valid = await verifyIngredientCandidates(candidates, budget);
-    if (!valid) {
-      removedCount += 1;
-      return null;
-    }
-
-    const normalized = canonicalizeText(name);
-    if (riskyKeys.has(normalizeKey(normalized))) {
-      return null;
-    }
-
-    return normalized;
-  });
-
-  const verifiedSafe = dedupeStrings(safeChecks.filter(Boolean));
+  // Keep parsed safe ingredients (already filtered by parser),
+  // only remove obvious duplicates against risky ingredients.
+  const verifiedSafe = dedupeStrings(safeInput).filter(
+    (name) => !riskyKeys.has(normalizeKey(name))
+  );
   const totalDetected = verifiedRisky.length + verifiedSafe.length;
   const safeCount = verifiedSafe.length;
   const summary = recomputeSummary(verifiedRisky.length, totalDetected);
