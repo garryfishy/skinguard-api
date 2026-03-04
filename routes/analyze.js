@@ -1,6 +1,7 @@
 const express = require('express');
 const { analyzeIngredients, HF_MODEL_ID } = require('../services/huggingface');
 const { parseAIResponse } = require('../utils/parseAIResponse');
+const { verifyParsedIngredientsOnline } = require('../utils/verifyIngredientOnline');
 
 const router = express.Router();
 
@@ -58,10 +59,11 @@ router.post('/', async (req, res) => {
     const startedAt = Date.now();
     const rawResult = await analyzeIngredients(sanitizedText);
     const parsed = parseAIResponse(rawResult, sanitizedText);
+    const verified = await verifyParsedIngredientsOnline(parsed);
 
     return res.status(200).json({
       success: true,
-      data: parsed,
+      data: verified,
       meta: {
         model: HF_MODEL_ID,
         analysisTimeMs: Date.now() - startedAt,
